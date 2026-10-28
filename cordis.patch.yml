@@ -6,4 +6,5 @@
     - id: dsh-omnibridge
       name: dsh-omnibridge
       config:
-        allowFrom: []
+        allowFrom:
+          - "2711686331"

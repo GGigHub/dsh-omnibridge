@@ -225,9 +225,8 @@ export function apply(ctx) {
   scope.watch(() => startBridge())
   startBridge()
 
-  ctx.inject(['webServer'], (routeCtx) => {
-    // 状态
-    routeCtx.effect(() => routeCtx.webServer.register({
+  // 桌面版在 apply 时 webServer 已经在 ctx 上。inject 等到服务出现再注册，这条路由会一直 404。
+  ctx.effect(() => ctx.webServer.register({
       kind: 'exact',
       path: `${API_PREFIX}/status`,
       handler: async (request, response) => {
@@ -249,7 +248,7 @@ export function apply(ctx) {
     }), 'dsh-omnibridge: status route')
 
     // 开关
-    routeCtx.effect(() => routeCtx.webServer.register({
+    ctx.effect(() => ctx.webServer.register({
       kind: 'exact',
       path: `${API_PREFIX}/settings`,
       handler: async (request, response) => {
@@ -290,7 +289,7 @@ export function apply(ctx) {
     }), 'dsh-omnibridge: settings route')
 
     // —— 平台扫码接入（飞书/钉钉/QQ 官方，协议见 channels/scan-registration.mjs） ——
-    routeCtx.effect(() => routeCtx.webServer.register({
+    ctx.effect(() => ctx.webServer.register({
       kind: 'exact',
       path: `${API_PREFIX}/scan/begin`,
       handler: async (request, response) => {
@@ -306,7 +305,7 @@ export function apply(ctx) {
       }
     }), 'dsh-omnibridge: scan begin')
 
-    routeCtx.effect(() => routeCtx.webServer.register({
+    ctx.effect(() => ctx.webServer.register({
       kind: 'exact',
       path: `${API_PREFIX}/scan/poll`,
       handler: async (request, response) => {
@@ -322,7 +321,7 @@ export function apply(ctx) {
       }
     }), 'dsh-omnibridge: scan poll')
 
-    routeCtx.effect(() => routeCtx.webServer.register({
+    ctx.effect(() => ctx.webServer.register({
       kind: 'exact',
       path: `${API_PREFIX}/scan/wecom-kf`,
       handler: async (request, response) => {
@@ -337,7 +336,6 @@ export function apply(ctx) {
         }
       }
     }), 'dsh-omnibridge: scan wecom-kf')
-  })
 }
 
 export { NAMESPACE, API_PREFIX }
