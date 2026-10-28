@@ -1,4 +1,5 @@
 node_modules/
+data/
 weixin_oc.state.json
 config.json
 AstrBot-master/

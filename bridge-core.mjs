@@ -13,7 +13,10 @@
  * @module dsh-omnibridge/bridge-core
  */
 
+import { dirname, join } from 'node:path'
+import { fileURLToPath } from 'node:url'
 import { createUserMessage } from './channels/host-packages.mjs'
+import { applyProfileEdit, ingestTurn, renderMemoryNote, retrieveMemory, splitMemoryUpdate } from './channels/qq-memory.mjs'
 
 /** 平台 Channel 基类（对标 AstrBot Platform）。 */
 export class Channel {
@@ -345,6 +348,33 @@ export class Bridge {
     this.limiter.clear()
   }
 
+  memoryDir() {
+    return this.config.memoryDir || join(dirname(fileURLToPath(import.meta.url)), 'data', 'memory')
+  }
+
+  /** 把对方这句写入原文和碎片，再按这句话挑出相关的几层。写盘失败不耽误回话。 */
+  noteMemory(sessionKey, spoken) {
+    if (!sessionKey) return ''
+    try {
+      const dir = this.memoryDir()
+      if (spoken) ingestTurn(dir, sessionKey, { role: 'user', text: spoken })
+      return renderMemoryNote(retrieveMemory(dir, sessionKey, spoken))
+    } catch (error) {
+      this.ctx.logger?.warn?.('[dsh-omnibridge] 记忆读取失败: %s', error instanceof Error ? error.message : String(error))
+      return ''
+    }
+  }
+
+  keepMemory(sessionKey, edit, visible) {
+    try {
+      const dir = this.memoryDir()
+      if (edit) applyProfileEdit(dir, sessionKey, edit)
+      if (visible) ingestTurn(dir, sessionKey, { role: 'assistant', text: visible })
+    } catch (error) {
+      this.ctx.logger?.warn?.('[dsh-omnibridge] 记忆写入失败: %s', error instanceof Error ? error.message : String(error))
+    }
+  }
+
   /** 入站统一入口（channel 调用）。 */
   async handleInbound(msg) {
     if (!(msg instanceof InboundMessage)) return
@@ -380,8 +410,11 @@ export class Bridge {
       return
     }
 
-    if (msg.contextNote) {
-      text = text ? `${msg.contextNote}\n${text}` : String(msg.contextNote)
+    const spoken = text
+    const memoryNote = this.noteMemory(msg.sessionKey, spoken)
+    const notes = [msg.contextNote, memoryNote].filter(Boolean)
+    if (notes.length) {
+      text = text ? `${notes.join('\n')}\n${text}` : notes.join('\n')
     }
 
     // 图片落库：先于 turn 提交。附件服务缺失/全部失败时按有无文本决定降级或拒收
@@ -542,10 +575,14 @@ export class Bridge {
   /** 会话路由：懒创建。返回 route（已存在或新创建）。 */
   routeFor(msg) {
     let route = this.routes.get(msg.sessionKey)
-    if (route) return route
+    if (route) {
+      route.sessionKey = msg.sessionKey
+      return route
+    }
     const sessionId = newSessionId(msg.platform)
     route = {
       sessionId,
+      sessionKey: msg.sessionKey,
       target: msg.raw?.target ?? msg.sessionKey,
       channelId: msg.platform,
       replyToken: msg.replyToken || msg.raw?.replyToken || null,
@@ -818,9 +855,11 @@ export class Bridge {
       }
       if (event.type === 'assistant/message') {
         const text = textOfAssistantMessage(event.data?.message)
-        if (text.trim()) {
+        const { visible, edit } = splitMemoryUpdate(text)
+        if (route.sessionKey && (edit || visible)) this.keepMemory(route.sessionKey, edit, visible)
+        if (visible.trim()) {
           route.lastActive = Date.now()
-          void sendOutbound(route, text)
+          void sendOutbound(route, visible)
         }
         return
       }
