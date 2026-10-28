@@ -13,7 +13,7 @@
  * @module dsh-omnibridge/bridge-core
  */
 
-import { createUserMessage } from '@deepseek-ai/dsh-llm'
+import { createUserMessage } from './channels/host-packages.mjs'
 
 /** 平台 Channel 基类（对标 AstrBot Platform）。 */
 export class Channel {
@@ -367,7 +367,7 @@ export class Bridge {
     const content = []
     if (text) content.push({ type: 'text', text })
     content.push(...imageBlocks)
-    agent.followup(createUserMessage({
+    agent.followup(await createUserMessage({
       content,
       source: { kind: 'user' },
     }))
@@ -684,7 +684,7 @@ export class Bridge {
       const agent = await this.ensureAgent(route)
       route.lastActive = Date.now()
       if (prompt) {
-        agent?.followup(createUserMessage({
+        agent?.followup(await createUserMessage({
           content: [{ type: 'text', text: prompt }],
           source: { kind: 'user' },
         }))

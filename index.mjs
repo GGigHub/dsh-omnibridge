@@ -46,7 +46,7 @@
 import { readFileSync, writeFileSync, mkdirSync } from 'node:fs'
 import { dirname, join } from 'node:path'
 import { fileURLToPath } from 'node:url'
-import z from '@deepseek-ai/schemastery'
+import { z } from './channels/host-packages.mjs'
 import { Bridge } from './bridge-core.mjs'
 import { beginScan, pollScan, wecomKfScan } from './channels/scan-registration.mjs'
 import { OneBotChannel } from './channels/onebot.mjs'
