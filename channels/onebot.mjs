@@ -6,16 +6,35 @@
  *
  * target 约定："group:<群号>" | "private:<QQ号>"
  *
+ * QQ 肥鱼补充（只在这一路）：真表情、语音条、群里喊名字叫醒、背后认人。
+ *
  * @module dsh-omnibridge/channels/onebot
  */
 
+import { spawn } from 'node:child_process'
+import { existsSync, mkdirSync, writeFileSync } from 'node:fs'
+import { homedir, tmpdir } from 'node:os'
+import { join } from 'node:path'
 import { Channel, InboundMessage } from '../bridge-core.mjs'
-import { Reconnector, escapeRegExp } from './retry.mjs'
+import { Reconnector } from './retry.mjs'
+import {
+  identityNote,
+  isSystemOutbound,
+  loadFaceMap,
+  parseOnebotMessage,
+  shouldAnswerGroup,
+  spokenForTts,
+  toOnebotSegments,
+  wantsVoiceReply,
+} from './qq-fish.mjs'
 
 /** OneBot action 回执等待上限。 */
 const RPC_TIMEOUT_MS = 8000
 /** 登录信息查询回执上限。 */
 const LOGIN_TIMEOUT_MS = 5000
+const RECORD_TIMEOUT_MS = 30000
+
+const faces = loadFaceMap()
 
 export class OneBotChannel extends Channel {
   constructor(config) {
@@ -26,6 +45,8 @@ export class OneBotChannel extends Channel {
     this.selfId = null
     this.reconnector = new Reconnector({ baseDelayMs: config.reconnectDelayMs || 5000 })
     this.closed = false
+    /** target → 下一句真人回复要不要配语音条 */
+    this.voiceTargets = new Set()
   }
 
   get url() {
@@ -70,9 +91,7 @@ export class OneBotChannel extends Channel {
     }
     this.ws.onopen = () => {
       this.ctx?.logger?.info?.('[dsh-omnibridge:onebot] connected to %s', this.url)
-      // 连接成功，退避归零
       this.reconnector.reset()
-      // 取 bot 自身 id 用于过滤自己的消息
       this.call('get_login_info', {}, LOGIN_TIMEOUT_MS).then((r) => {
         if (r?.retcode === 0 && r?.data?.user_id) this.selfId = String(r.data.user_id)
       }).catch(() => {})
@@ -80,7 +99,7 @@ export class OneBotChannel extends Channel {
     this.ws.onmessage = (ev) => {
       let data
       try { data = JSON.parse(String(ev.data)) } catch { return }
-      this.handleMessage(data)
+      void this.handleMessage(data)
     }
     this.ws.onclose = () => {
       this.ctx?.logger?.warn?.('[dsh-omnibridge:onebot] connection closed, reconnecting…')
@@ -92,12 +111,10 @@ export class OneBotChannel extends Channel {
   }
 
   scheduleReconnect() {
-    // 指数退避 + 抖动（Reconnector 内部管理 attempt，连接成功时 reset）
     this.reconnector.schedule(() => this.connect())
   }
 
-  handleMessage(data) {
-    // 回执
+  async handleMessage(data) {
     if (data.echo && this.pending.has(String(data.echo))) {
       const p = this.pending.get(String(data.echo))
       this.pending.delete(String(data.echo))
@@ -106,61 +123,109 @@ export class OneBotChannel extends Channel {
       else p.reject(new Error(`OneBot retcode ${data.retcode}: ${data.status || ''}`))
       return
     }
-    // 事件
-    if (data.post_type === 'message') {
-      const self = String(data.self_id ?? this.selfId ?? '')
-      const senderId = String(data.user_id ?? '')
-      if (self && senderId === self) return // 忽略自己的消息
-      let text = ''
-      let atMe = false
-      const images = []
-      if (typeof data.raw_message === 'string') {
-        if (self) atMe = new RegExp(`\\[CQ:at,qq=${escapeRegExp(self)}[,\\]]`).test(data.raw_message)
-        collectCqImages(data.raw_message, images)
-        text = data.raw_message.replace(/\[CQ:[^\]]+\]/g, '').trim()
-      } else if (Array.isArray(data.message)) {
-        text = data.message
-          .filter((s) => s?.type === 'text')
-          .map((s) => String(s.data?.text ?? ''))
-          .join('')
-          .trim()
-        if (self) atMe = data.message.some((s) => s?.type === 'at' && String(s.data?.qq ?? '') === self)
-        for (const seg of data.message) {
-          if (seg?.type !== 'image') continue
-          const url = String(seg.data?.url || seg.data?.file || '')
-          if (/^https?:\/\//i.test(url)) {
-            images.push({ url, ...(seg.data?.file ? { name: String(seg.data.file).slice(0, 120) } : {}) })
-          }
-        }
-      }
-      if (!text && !images.length) return
-      const isGroup = data.message_type === 'group'
-      // 群聊默认只响应 @机器人，防止群里每条消息都驱动 agent（刷屏+放大消耗）；
-      // groupAtOnly=false 恢复全量响应。selfId 未就绪时放行，兼容连接初期窗口。
-      if (isGroup && this.config.groupAtOnly !== false && self && !atMe) return
-      const target = isGroup ? `group:${data.group_id}` : `private:${senderId}`
-      const sessionKey = isGroup ? `qq-group:${data.group_id}` : `qq-private:${senderId}`
-      const senderName = data.sender?.card || data.sender?.nickname || senderId
-      this.bridge.handleInbound(new InboundMessage({
-        platform: 'onebot',
-        sessionKey,
-        senderId,
-        senderName,
-        text,
-        images: images.length ? images : undefined,
-        raw: { target, messageId: data.message_id },
-      })).catch(() => {})
+    if (data.post_type !== 'message') return
+    const self = String(data.self_id ?? this.selfId ?? '')
+    const senderId = String(data.user_id ?? '')
+    if (self && senderId === self) return
+    const parsed = parseOnebotMessage(data, { selfId: self, idToName: faces.idToName })
+    const isGroup = data.message_type === 'group'
+    let replyToMe = false
+    if (isGroup && parsed.replyId && self) replyToMe = await this.replyTargetsSelf(parsed.replyId)
+    let text = parsed.text
+    // 先听完语音，群里喊「大肥鱼」的声音才叫得醒她
+    if (parsed.voice && (!isGroup || parsed.atMe || replyToMe || this.config.groupAtOnly === false || !(parsed.text || '').trim())) {
+      const heard = await this.transcribeVoice(parsed.voice)
+      text = text ? `${text}\n${heard}` : heard
+    }
+    if (isGroup && !shouldAnswerGroup({
+      groupAtOnly: this.config.groupAtOnly !== false,
+      selfReady: !!self,
+      atMe: parsed.atMe,
+      replyToMe,
+      text,
+      wakeWords: this.config.groupWakeWords || ['大肥鱼'],
+    })) return
+    if (parsed.voice && !text.includes('语音转写') && !text.includes('没听清')) {
+      const heard = await this.transcribeVoice(parsed.voice)
+      text = text ? `${text}\n${heard}` : heard
+    }
+    if (!text && !parsed.images.length) return
+
+    const target = isGroup ? `group:${data.group_id}` : `private:${senderId}`
+    if (this.config.voiceReply !== false && wantsVoiceReply(text)) this.voiceTargets.add(target)
+    const sessionKey = isGroup ? `qq-group:${data.group_id}` : `qq-private:${senderId}`
+    const senderName = data.sender?.card || data.sender?.nickname || senderId
+    await this.bridge.handleInbound(new InboundMessage({
+      platform: 'onebot',
+      sessionKey,
+      senderId,
+      senderName,
+      text,
+      images: parsed.images.length ? parsed.images : undefined,
+      contextNote: identityNote(senderId, senderName, this.config.ownerIds || ['2711686331']),
+      raw: { target, messageId: data.message_id },
+    })).catch(() => {})
+  }
+
+  async replyTargetsSelf(messageId) {
+    try {
+      const id = /^\d+$/.test(String(messageId)) ? Number(messageId) : messageId
+      const r = await this.call('get_msg', { message_id: id })
+      const uid = r?.data?.sender?.user_id ?? r?.data?.user_id
+      return String(uid || '') === String(this.selfId)
+    } catch {
+      return false
     }
   }
 
-  /** 发送文本。target: "group:<id>" | "private:<id>" */
+  async transcribeVoice(voice) {
+    try {
+      const file = await this.resolveVoiceFile(voice)
+      if (!file) return '[语音]（没听清）'
+      const { transcribeWavFile } = await import('./qq-stt.mjs')
+      const heard = transcribeWavFile(file)
+      return heard ? `（语音转写：${heard}）` : '[语音]（没听清）'
+    } catch (error) {
+      this.ctx?.logger?.warn?.('[dsh-omnibridge:onebot] 语音转写失败: %s', error instanceof Error ? error.message : String(error))
+      return '[语音]（没听清）'
+    }
+  }
+
+  async resolveVoiceFile(voice) {
+    if (voice.file) {
+      try {
+        const r = await this.call('get_record', { file: voice.file, out_format: 'wav' }, RECORD_TIMEOUT_MS)
+        const loc = r?.data?.file || r?.data?.url || ''
+        const local = await materializeMedia(String(loc))
+        if (local) return local
+      } catch (error) {
+        this.ctx?.logger?.warn?.('[dsh-omnibridge:onebot] get_record 失败: %s', error instanceof Error ? error.message : String(error))
+      }
+    }
+    if (voice.url) return materializeMedia(voice.url)
+    return null
+  }
+
+  /** 发送文本。有表情就改成表情段；这一轮若对方要求语音，再附一条语音。 */
   async send(target, text) {
     const [kind, id] = String(target).split(':')
     if (!id) throw new Error(`无效 target: ${target}`)
     const action = kind === 'group' ? 'send_group_msg' : 'send_private_msg'
-    const params = kind === 'group' ? { group_id: Number(id) } : { user_id: Number(id) }
-    params.message = text
-    await this.call(action, params)
+    const who = kind === 'group' ? { group_id: Number(id) } : { user_id: Number(id) }
+    if (this.voiceTargets.has(target) && !isSystemOutbound(text)) {
+      this.voiceTargets.delete(target)
+      const spoken = spokenForTts(text)
+      if (spoken) {
+        try {
+          const wav = await synthesizeSpeech(spoken, this.config.ttsScript)
+          await this.call(action, { ...who, message: [{ type: 'record', data: { file: wav } }] }, RECORD_TIMEOUT_MS)
+        } catch (error) {
+          this.ctx?.logger?.warn?.('[dsh-omnibridge:onebot] 语音回复失败: %s', error instanceof Error ? error.message : String(error))
+        }
+      }
+    }
+    const segments = toOnebotSegments(text, faces.nameToId)
+    await this.call(action, { ...who, message: segments || text })
   }
 
   async stop() {
@@ -172,21 +237,54 @@ export class OneBotChannel extends Channel {
   }
 }
 
-/** OneBot CQ 码实体反转义（url 等值内含的 &, [, ], 逗号会被转义）。 */
-function cqUnescape(s) {
-  return String(s || '')
-    .replace(/&amp;/g, '&')
-    .replace(/&#91;/g, '[')
-    .replace(/&#93;/g, ']')
-    .replace(/&comma;/g, ',')
+function mediaDir() {
+  const dir = join(tmpdir(), 'dsh-omnibridge-qq')
+  mkdirSync(dir, { recursive: true })
+  return dir
 }
 
-/** 从 raw_message 的 [CQ:image,…] 码中收集图片下载地址（剥离前调用）。 */
-function collectCqImages(rawMessage, out) {
-  for (const m of String(rawMessage).matchAll(/\[CQ:image,[^\]]*\]/g)) {
-    const url = cqUnescape(/(?:^|[&,])url=([^,\]]*)/.exec(m[0])?.[1] || '')
-    if (!/^https?:\/\//i.test(url)) continue
-    const file = cqUnescape(/(?:^|[&,])file=([^,\]]*)/.exec(m[0])?.[1] || '')
-    out.push({ url, ...(file ? { name: file.slice(0, 120) } : {}) })
+/** 把 OneBot 给的路径、网址或 base64 落成本地文件。 */
+export async function materializeMedia(loc) {
+  const value = String(loc || '').trim()
+  if (!value) return null
+  if (value.startsWith('base64://')) {
+    const file = join(mediaDir(), `in-${Date.now()}.wav`)
+    writeFileSync(file, Buffer.from(value.slice('base64://'.length), 'base64'))
+    return file
   }
+  if (/^https?:\/\//i.test(value)) {
+    const resp = await fetch(value, { signal: AbortSignal.timeout(RECORD_TIMEOUT_MS) })
+    if (!resp.ok) return null
+    const file = join(mediaDir(), `in-${Date.now()}.wav`)
+    writeFileSync(file, Buffer.from(await resp.arrayBuffer()))
+    return file
+  }
+  const path = value.replace(/^file:\/\//, '')
+  if (existsSync(path)) return path
+  return null
+}
+
+export function defaultTtsScript() {
+  const candidates = [
+    join('D:\\Gitobjects\\dsh-voice-mode\\tools\\tts-to-file.mjs'),
+    join(homedir(), 'dsh-voice-mode', 'tools', 'tts-to-file.mjs'),
+  ]
+  return candidates.find((p) => existsSync(p)) || ''
+}
+
+/** 用本机已有的语音脚本合成 wav，返回文件路径。 */
+export function synthesizeSpeech(text, script) {
+  const tts = script || defaultTtsScript()
+  if (!tts || !existsSync(tts)) return Promise.reject(new Error('找不到本机语音合成脚本'))
+  const out = join(mediaDir(), `out-${Date.now()}.wav`)
+  return new Promise((resolve, reject) => {
+    const child = spawn(process.execPath, [tts, '--text', text, '--out', out, '--engine', 'kokoro'], { windowsHide: true })
+    let err = ''
+    child.stderr?.on('data', (d) => { err += String(d) })
+    child.on('error', reject)
+    child.on('close', (code) => {
+      if (code === 0 && existsSync(out)) resolve(out)
+      else reject(new Error(err.trim() || `语音合成退出码 ${code}`))
+    })
+  })
 }

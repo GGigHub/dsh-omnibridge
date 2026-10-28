@@ -40,7 +40,7 @@ export class Channel {
 
 /** 统一入站消息（对标 AstrBotMessage 精简）。 */
 export class InboundMessage {
-  constructor({ platform, sessionKey, senderId, senderName, text, raw, replyToken, images }) {
+  constructor({ platform, sessionKey, senderId, senderName, text, raw, replyToken, images, contextNote }) {
     this.platform = platform
     this.sessionKey = sessionKey
     this.senderId = senderId
@@ -48,6 +48,8 @@ export class InboundMessage {
     this.text = text || ''
     this.raw = raw
     this.replyToken = replyToken || null
+    /** 只进模型上下文的旁注（QQ 认人）。命令不带它，也不会发回聊天软件。 */
+    this.contextNote = contextNote || ''
     /**
      * 入站图片描述列表（channel 只负责提取，Bridge 统一取字节并经 attachments 落库）：
      * { url?: 'https://…' } 或 { dataUrl?: 'data:image/png;base64,…' }，均可带 name。
@@ -319,6 +321,10 @@ export class Bridge {
     if (text.startsWith('/')) {
       await this.handleCommand(msg, text)
       return
+    }
+
+    if (msg.contextNote) {
+      text = text ? `${msg.contextNote}\n${text}` : String(msg.contextNote)
     }
 
     // 图片落库：先于 turn 提交。附件服务缺失/全部失败时按有无文本决定降级或拒收

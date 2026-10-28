@@ -102,6 +102,14 @@ export const Config = z.object({
     enabled: z.boolean().default(true),
     url: z.string().default('ws://127.0.0.1:3001?access_token=%20'),
     reconnectDelayMs: z.number().default(5000),
+    // 群聊默认要 @、引用她，或喊醒词。false = 群里每句都回
+    groupAtOnly: z.boolean().default(true),
+    groupWakeWords: z.array(z.string()).default(['大肥鱼']),
+    // 这些 QQ 在她的上下文里标成主人，对方看不到
+    ownerIds: z.array(z.string()).default(['2711686331']),
+    // 对方明说用语音回时，用本机语音合成一条语音
+    voiceReply: z.boolean().default(true),
+    ttsScript: z.string().default(''),
   }).default({}),
   telegram: z.object({
     enabled: z.boolean().default(false),

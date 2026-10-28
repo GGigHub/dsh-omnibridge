@@ -308,9 +308,13 @@
           ],
         },
         {
-          key: 'onebot', title: 'QQ · OneBot v11', desc: 'NapCat / go-cqhttp / Lagrange 正向 WS（QQ 官方机器人同样经此或 webhook 覆盖）', enable: true, fields: [
+          key: 'onebot', title: 'QQ · OneBot v11', desc: 'NapCat / go-cqhttp / Lagrange 正向 WS。表情、语音和群唤醒只作用在这一路', enable: true, fields: [
             { f: 'url', label: 'WS 地址', type: 'secret', ph: 'ws://127.0.0.1:3001?access_token=…' },
             { f: 'reconnectDelayMs', label: '重连基间隔（ms）', type: 'number' },
+            { f: 'groupAtOnly', label: '群聊需 @ 或喊醒', type: 'bool' },
+            { f: 'groupWakeWords', label: '群聊唤醒词', type: 'lines', hint: '喊到这些词也会叫醒她，私聊不用喊' },
+            { f: 'ownerIds', label: '主人 QQ', type: 'lines', hint: '这些号在她眼里是主人，对方看不到这行标记' },
+            { f: 'voiceReply', label: '按要求回语音条', type: 'bool' },
           ],
         },
         {
