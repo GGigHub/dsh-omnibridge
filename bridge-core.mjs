@@ -264,6 +264,7 @@ export class Bridge {
       }
     }
     this.attachOutbound()
+    this.watchDeletedSessions()
 
     // 会话自动清理：周期性 GC 超过 TTL 的空闲会话（仅当配置了 sessionTtlMinutes>0）
     const ttl = Number(this.config?.sessionTtlMinutes) || 0
@@ -280,7 +281,63 @@ export class Bridge {
     }
   }
 
-  /** 停止所有 channel。 */
+  /** 桌面里删掉会话后，QQ 这边立刻忘掉旧编号，下一条私聊另开一条。 */
+  watchDeletedSessions() {
+    const forget = (sessionId) => {
+      const id = String(sessionId || '')
+      if (!id) return
+      const route = this.routesBySession.get(id)
+      if (!route) return
+      this.routesBySession.delete(id)
+      for (const [key, value] of this.routes) {
+        if (value === route) this.routes.delete(key)
+      }
+    }
+    const listen = (name, fn) => {
+      try {
+        const dispose = this.ctx.on?.(name, fn, { global: true })
+        if (typeof dispose === 'function') this.disposers.push(dispose)
+      } catch {}
+    }
+    listen('session/disposed', (session) => forget(session?.id))
+    listen('agent/disposed', (payload) => forget(payload?.agent?.id))
+    listen('api-session/removed', (sessionId) => forget(sessionId))
+  }
+
+  /** 桌面「归档」只是把会话藏起来，编号还在，新消息会被直接拒绝。 */
+  sessionArchived(sessionId) {
+    const id = String(sessionId || '')
+    if (!id) return false
+    try {
+      const registry = this.ctx.get?.('workspaceRegistry')
+      const ids = registry?.archivedSessionIds
+      if (!Array.isArray(ids)) return false
+      return ids.some((item) => String(item) === id)
+    } catch {
+      return false
+    }
+  }
+
+  agentUsable(agent) {
+    if (!agent?.options?.model) return false
+    const cancelKind = agent.phase?.abort?.signal?.reason?.kind
+    if (cancelKind === 'disposed') return false
+    const id = agent.id || agent.session?.id
+    if (this.sessionArchived(id)) return false
+    try {
+      const sessions = this.ctx.get?.('sessions')
+      if (typeof sessions?.get === 'function' && id && sessions.get(id) == null) return false
+    } catch {}
+    return true
+  }
+
+  retarget(route) {
+    this.routesBySession.delete(route.sessionId)
+    route.sessionId = newSessionId(route.channelId || 'onebot')
+    route.agentPromise = null
+    route.createdId = null
+    this.routesBySession.set(route.sessionId, route)
+  }
   async stop() {
     for (const d of this.disposers) { try { d() } catch {} }
     this.disposers = []
@@ -421,33 +478,62 @@ export class Bridge {
     return { data: new Uint8Array(buf), mediaType, ...(name ? { name } : {}) }
   }
 
+  agentRegistry() {
+    const agents = this.ctx.get?.('agents')
+    if (!agents) throw new Error('对话服务还没准备好')
+    return agents
+  }
+
+  // 人格模板要读模型名。QQ 会话没写上模型时，整句会报 {{model}} 没有值。
+  modelRoute() {
+    if (this.config.agentProvider && this.config.agentModel) {
+      return { provider: this.config.agentProvider, model: this.config.agentModel }
+    }
+    try {
+      const service = this.ctx.get?.('agentDefaultModel')
+      const selection = typeof service?.currentSelection === 'function' ? service.currentSelection() : null
+      if (selection?.provider && selection?.model) {
+        return {
+          provider: selection.provider,
+          model: selection.model,
+          ...(selection.reasoningEffort ? { reasoningEffort: selection.reasoningEffort } : {}),
+        }
+      }
+    } catch {}
+    return { provider: 'deepseek-account', model: 'deepseek-flash' }
+  }
+
   // 确保 session 存在：已有则复用，没有则创建。避免重复 create 报 already exists。
   // 同一 session 并发创建用 in-flight promise 去重（快速连发两条消息的常见竞态）。
   async ensureAgent(route) {
     if (route.agentPromise) return route.agentPromise
-    const existing = this.ctx.agents.get(route.sessionId)
-    if (existing) return existing
+    const existing = this.agentRegistry().get(route.sessionId)
+    if (this.agentUsable(existing)) return existing
+    // 旧会话被归档或删掉后，不拆掉它，只给这条 QQ 另开一个新编号。
+    if (existing || route.createdId || this.sessionArchived(route.sessionId)) this.retarget(route)
+    const chosen = this.modelRoute()
     const p = (async () => {
       const meta = {}
       if (this.config.cwd) meta.cwd = this.config.cwd
       if (this.config.agentPreset) meta.agentPreset = this.config.agentPreset
-      try {
-        const handle = await this.ctx.agents.create({
-          sessionId: route.sessionId,
-          meta,
-          agentOptions: {
-            ...(this.config.agentProvider ? { provider: this.config.agentProvider } : {}),
-            ...(this.config.agentModel ? { model: this.config.agentModel } : {}),
-          },
-        })
-        if (handle?.id) route.createdId = String(handle.id)
-        return this.ctx.agents.get(route.sessionId) || handle?.agent
-      } catch (error) {
-        // 已存在（或多进程竞争）→ 直接复用
-        const agent = this.ctx.agents.get(route.sessionId)
-        if (agent) return agent
-        throw error
+      let lastError
+      for (let attempt = 0; attempt < 2; attempt++) {
+        try {
+          const handle = await this.agentRegistry().create({
+            sessionId: route.sessionId,
+            meta,
+            agentOptions: chosen,
+          })
+          route.createdId = String(handle?.agent?.id || handle?.id || route.sessionId)
+          return this.agentRegistry().get(route.sessionId) || handle?.agent
+        } catch (error) {
+          lastError = error
+          const agent = this.agentRegistry().get(route.sessionId)
+          if (this.agentUsable(agent)) return agent
+          this.retarget(route)
+        }
       }
+      throw lastError
     })().finally(() => { if (route.agentPromise === p) route.agentPromise = null })
     route.agentPromise = p
     return p
@@ -571,7 +657,7 @@ export class Bridge {
     for (const [key, route] of [...this.routes]) {
       if ((route.lastActive || 0) < cutoff) {
         try {
-          const agent = this.ctx.agents.get(route.sessionId)
+          const agent = this.agentRegistry().get(route.sessionId)
           if (agent?.dispose) agent.dispose()
         } catch {}
         this.routes.delete(key)
@@ -665,7 +751,7 @@ export class Bridge {
     }
     const oldId = route.sessionId
     try {
-      const oldAgent = this.ctx.agents.get(oldId)
+      const oldAgent = this.agentRegistry().get(oldId)
       if (oldAgent?.dispose) oldAgent.dispose()
     } catch {}
     this.routesBySession.delete(oldId)
@@ -727,7 +813,7 @@ export class Bridge {
         // 顺序颠倒会让 ack 的静默期定时器抢在标记之前武装（wait=true 提前返回）
         const startCh = this.channelOf(route.channelId)
         try { startCh?.onTurnStart?.(route.target) } catch {}
-        if (this.config.ackTurnStart !== false) void sendOutbound(route, '⏳ 收到，开始处理…')
+        if (this.config.ackTurnStart === true) void sendOutbound(route, '⏳ 收到，开始处理…')
         return
       }
       if (event.type === 'assistant/message') {

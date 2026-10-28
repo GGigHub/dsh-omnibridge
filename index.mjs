@@ -62,7 +62,8 @@ const CONFIG_FILE = join(fileURLToPath(new URL('.', import.meta.url)), 'config.j
 const API_PREFIX = '/dsh-omnibridge'
 
 export const name = 'dsh-omnibridge'
-export const inject = ['settings', 'sessions', 'agents']
+// 网页服务必须写进依赖，路由才能挂上。对话服务不写：它晚就绪时会把整个插件卡住，设置页就一直 404。
+export const inject = ['webServer']
 
 const webhookSchema = z.object({
   id: z.string().required(),
@@ -196,8 +197,17 @@ function buildChannels(config) {
   return channels
 }
 
-export function apply(ctx) {
-  const scope = ctx.settings.register(NAMESPACE, Config, { applies: 'live' })
+export function apply(ctx, config) {
+  let live = config && typeof config === 'object' ? config : {}
+  const scope = {
+    get() { return (ctx.fiber && ctx.fiber.config) || live },
+    async update(patch) {
+      const next = { ...this.get(), ...patch }
+      live = next
+      if (ctx.fiber && typeof ctx.fiber.update === 'function') ctx.fiber.update(next)
+    },
+    watch() { return () => {} },
+  }
   let bridge = null
 
   // rebuild 串行链：settings 快速连改 / 手动开关会并发触发 startBridge，
@@ -225,8 +235,9 @@ export function apply(ctx) {
   scope.watch(() => startBridge())
   startBridge()
 
-  // 桌面版在 apply 时 webServer 已经在 ctx 上。inject 等到服务出现再注册，这条路由会一直 404。
-  ctx.effect(() => ctx.webServer.register({
+  // 桌面版在 apply 时 webServer 已经在 ctx 上。
+  ctx.effect(() => {
+    return ctx.webServer.register({
       kind: 'exact',
       path: `${API_PREFIX}/status`,
       handler: async (request, response) => {
@@ -245,7 +256,8 @@ export function apply(ctx) {
           respondJson(response, 400, { error: error instanceof Error ? error.message : String(error) })
         }
       }
-    }), 'dsh-omnibridge: status route')
+    })
+  }, 'dsh-omnibridge: status route')
 
     // 开关
     ctx.effect(() => ctx.webServer.register({

@@ -795,7 +795,14 @@
             setStatus(j); setMsg('')
             if (j && j.hasQr) setImgErr(false)
           }).catch(function (e) {
-            setStatus(null); setMsg('状态查询失败：' + String((e && e.message) || e) + '（个人微信渠道未启用时不可用）')
+            var text = String((e && e.message) || e)
+            if (text.indexOf('404') !== -1) {
+              setStatus({ unavailable: true })
+              setMsg('')
+              return
+            }
+            setStatus(null)
+            setMsg('状态查询失败：' + text)
           })
         }, [])
         React.useEffect(function () { refreshStatus() }, [refreshStatus])
@@ -819,7 +826,9 @@
         }
 
         var loggedIn = !!(status && status.loggedIn)
-        var statePill = loggedIn ? { text: '已登录', on: true }
+        var unavailable = !!(status && status.unavailable)
+        var statePill = unavailable ? { text: '个人微信未开启', on: false }
+          : loggedIn ? { text: '已登录', on: true }
           : (status && status.loggingIn) ? { text: '登录流程进行中…等待扫码', on: true }
           : { text: '待扫码（点击「刷新二维码」获取）', on: false }
 
@@ -840,7 +849,12 @@
               h(Pill, { on: statePill.on, text: statePill.text }),
               h('button', { style: S.btn, onClick: refreshStatus }, '↻ 刷新状态'))),
           msg ? h('div', { style: S.err, marginBottom: '6px' }, msg) : null,
-          loggedIn ? h('div', { style: S.panel },
+          unavailable ? h('div', null,
+            h('div', { style: Object.assign({}, S.dim, { marginBottom: '10px' }) },
+              '个人微信没开，这里不会出二维码。大肥鱼的 QQ 不用在这一页扫码，去「运行状态」看 QQ 是否开着。'),
+            ScanSection(),
+            h(OtherPlatformsCard))
+          : loggedIn ? h('div', { style: S.panel },
             h('div', { style: S.ok }, '✓ 个人微信已登录（token 有效）'),
             h('div', { style: Object.assign({}, S.dim, { marginTop: '4px' }) },
               '收发消息正常工作中。如需更换账号或登录态失效，点下方按钮重新扫码。'),
