@@ -168,3 +168,36 @@ export function toOnebotSegments(text, nameToId) {
   if (last < src.length) parts.push({ type: 'text', data: { text: src.slice(last) } })
   return parts.filter((p) => p.type !== 'text' || p.data.text)
 }
+
+/** 从回复里拆出发图和发说说。标记本身不留给对方看。 */
+export function splitOutbound(text) {
+  const images = []
+  let qzone = null
+  const visible = String(text || '')
+    .replace(/<image>([\s\S]*?)<\/image>/gi, (_, body) => {
+      const src = String(body || '').trim()
+      if (src) images.push(src)
+      return ''
+    })
+    .replace(/!\[[^\]]*\]\((https?:\/\/[^)\s]+)\)/g, (_, url) => {
+      images.push(url)
+      return ''
+    })
+    .replace(/<qzone>([\s\S]*?)<\/qzone>/gi, (_, body) => {
+      qzone = String(body || '').trim()
+      return ''
+    })
+    .replace(/\n{3,}/g, '\n\n')
+    .trim()
+  return { visible, images, qzone }
+}
+
+/** NapCat 能发出去的图：网址、base64，或本机路径。 */
+export function isSendableImage(src) {
+  const value = String(src || '').trim()
+  if (/^https?:\/\//i.test(value)) return true
+  if (/^base64:\/\//i.test(value)) return true
+  if (/^file:\/\//i.test(value)) return true
+  if (/^[a-zA-Z]:[\\/]/.test(value) || value.startsWith('\\\\')) return true
+  return false
+}

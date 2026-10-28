@@ -15,14 +15,16 @@ import { spawn } from 'node:child_process'
 import { existsSync, mkdirSync, writeFileSync } from 'node:fs'
 import { homedir, tmpdir } from 'node:os'
 import { join } from 'node:path'
-import { Channel, InboundMessage } from '../bridge-core.mjs'
+import { Channel, InboundMessage, splitForDelivery } from '../bridge-core.mjs'
 import { Reconnector } from './retry.mjs'
 import {
   identityNote,
+  isSendableImage,
   isSystemOutbound,
   loadFaceMap,
   parseOnebotMessage,
   shouldAnswerGroup,
+  splitOutbound,
   spokenForTts,
   toOnebotSegments,
   wantsVoiceReply,
@@ -144,7 +146,14 @@ export class OneBotChannel extends Channel {
       replyToMe,
       text,
       wakeWords: this.config.groupWakeWords || ['大肥鱼'],
-    })) return
+    })) {
+      const heard = text || (parsed.images.length ? `[图片${parsed.images.length}张]` : '') || (parsed.voice ? '[语音]' : '')
+      if (heard) {
+        const who = data.sender?.card || data.sender?.nickname || senderId
+        this.bridge?.overhear?.(`qq-group:${data.group_id}`, `${who}：${heard}`)
+      }
+      return
+    }
     if (parsed.voice && !text.includes('语音转写') && !text.includes('没听清')) {
       const heard = await this.transcribeVoice(parsed.voice)
       text = text ? `${text}\n${heard}` : heard
@@ -162,7 +171,10 @@ export class OneBotChannel extends Channel {
       senderName,
       text,
       images: parsed.images.length ? parsed.images : undefined,
-      contextNote: identityNote(senderId, senderName, this.config.ownerIds || ['2711686331']),
+      contextNote: [
+        identityNote(senderId, senderName, this.config.ownerIds || ['2711686331']),
+        '[能做的事] 发图写 <image>网址或本机路径</image>。发说说写 <qzone>正文</qzone>，配图就把 <image> 放在同一条回复里。群里没点你的话已经记在这个群的记事里，不要主动插话。这些标记不要原样发出来。',
+      ].join('\n'),
       raw: { target, messageId: data.message_id },
     })).catch(() => {})
   }
@@ -206,15 +218,32 @@ export class OneBotChannel extends Channel {
     return null
   }
 
-  /** 发送文本。有表情就改成表情段；这一轮若对方要求语音，再附一条语音。 */
-  async send(target, text) {
+  /** 整段回复：先发说说和图片，再把剩下的文字分段发出。 */
+  async deliver(target, text, max = 2000) {
+    const { visible, images, qzone } = splitOutbound(text)
     const [kind, id] = String(target).split(':')
     if (!id) throw new Error(`无效 target: ${target}`)
     const action = kind === 'group' ? 'send_group_msg' : 'send_private_msg'
     const who = kind === 'group' ? { group_id: Number(id) } : { user_id: Number(id) }
-    if (this.voiceTargets.has(target) && !isSystemOutbound(text)) {
+    const pics = images.filter(isSendableImage)
+    let posted = false
+    if (qzone) {
+      try {
+        const params = { content: qzone.slice(0, 2000) }
+        if (pics.length) params.images = pics
+        await this.call('send_qzone_msg', params, 60000)
+        posted = true
+      } catch (error) {
+        this.ctx?.logger?.warn?.('[dsh-omnibridge:onebot] 发说说失败: %s', error instanceof Error ? error.message : String(error))
+        await this.call(action, { ...who, message: '说说没发出去。' })
+      }
+    }
+    const chatImages = posted ? [] : pics
+    let body = visible
+    if (!body && !chatImages.length && posted) body = '发到空间了。'
+    if (this.voiceTargets.has(target) && body && !isSystemOutbound(body)) {
       this.voiceTargets.delete(target)
-      const spoken = spokenForTts(text)
+      const spoken = spokenForTts(body)
       if (spoken) {
         try {
           const wav = await synthesizeSpeech(spoken, this.config.ttsScript)
@@ -224,8 +253,28 @@ export class OneBotChannel extends Channel {
         }
       }
     }
-    const segments = toOnebotSegments(text, faces.nameToId)
-    await this.call(action, { ...who, message: segments || text })
+    if (body) {
+      const chunks = splitForDelivery(body, max)
+      for (let i = 0; i < chunks.length; i++) {
+        const segments = toOnebotSegments(chunks[i], faces.nameToId) || [{ type: 'text', data: { text: chunks[i] } }]
+        if (i === chunks.length - 1) {
+          for (const file of chatImages) segments.push({ type: 'image', data: { file } })
+        }
+        await this.call(action, { ...who, message: segments })
+      }
+      return
+    }
+    if (chatImages.length) {
+      await this.call(action, {
+        ...who,
+        message: chatImages.map((file) => ({ type: 'image', data: { file } })),
+      })
+    }
+  }
+
+  /** 发送文本。有表情就改成表情段；这一轮若对方要求语音，再附一条语音。 */
+  async send(target, text) {
+    await this.deliver(target, text, this.bridge?.config?.maxMessageChars || 2000)
   }
 
   async stop() {

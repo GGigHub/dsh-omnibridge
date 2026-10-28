@@ -2,10 +2,12 @@ import assert from 'node:assert/strict'
 import test from 'node:test'
 import {
   identityNote,
+  isSendableImage,
   isSystemOutbound,
   loadFaceMap,
   parseOnebotMessage,
   shouldAnswerGroup,
+  splitOutbound,
   spokenForTts,
   toOnebotSegments,
   wantsVoiceReply,
@@ -60,6 +62,15 @@ test('只有明说用语音回才念出来，系统提示不念', () => {
   assert.equal(isSystemOutbound('⏳ 收到，开始处理…'), true)
   assert.equal(isSystemOutbound('在的[旺柴]'), false)
   assert.equal(spokenForTts('在的[旺柴]呀'), '在的呀')
+})
+
+test('发图和说说的标记不会留在聊天文字里', () => {
+  const split = splitOutbound('给你看\n<image>https://example.com/a.png</image>\n<qzone>今天的云</qzone>')
+  assert.equal(split.visible, '给你看')
+  assert.deepEqual(split.images, ['https://example.com/a.png'])
+  assert.equal(split.qzone, '今天的云')
+  assert.equal(isSendableImage('https://example.com/a.png'), true)
+  assert.equal(isSendableImage('不是图'), false)
 })
 
 test('数组消息里的语音和引用号能拆出来', () => {

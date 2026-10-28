@@ -17,6 +17,7 @@ import { dirname, join } from 'node:path'
 import { fileURLToPath } from 'node:url'
 import { createUserMessage } from './channels/host-packages.mjs'
 import { applyProfileEdit, ingestTurn, renderMemoryNote, retrieveMemory, splitMemoryUpdate } from './channels/qq-memory.mjs'
+import { splitOutbound } from './channels/qq-fish.mjs'
 
 /** 平台 Channel 基类（对标 AstrBot Platform）。 */
 export class Channel {
@@ -350,6 +351,17 @@ export class Bridge {
 
   memoryDir() {
     return this.config.memoryDir || join(dirname(fileURLToPath(import.meta.url)), 'data', 'memory')
+  }
+
+  /** 群里没叫她的话只记下来，不叫醒。 */
+  overhear(sessionKey, text) {
+    const line = String(text || '').trim()
+    if (!sessionKey || !line) return
+    try {
+      ingestTurn(this.memoryDir(), sessionKey, { role: 'user', text: line })
+    } catch (error) {
+      this.ctx.logger?.warn?.('[dsh-omnibridge] 群消息记入失败: %s', error instanceof Error ? error.message : String(error))
+    }
   }
 
   /** 把对方这句写入原文和碎片，再按这句话挑出相关的几层。写盘失败不耽误回话。 */
@@ -855,11 +867,12 @@ export class Bridge {
       }
       if (event.type === 'assistant/message') {
         const text = textOfAssistantMessage(event.data?.message)
-        const { visible, edit } = splitMemoryUpdate(text)
+        const { visible: remembered, edit } = splitMemoryUpdate(text)
+        const { visible } = splitOutbound(remembered)
         if (route.sessionKey && (edit || visible)) this.keepMemory(route.sessionKey, edit, visible)
-        if (visible.trim()) {
+        if (remembered.trim()) {
           route.lastActive = Date.now()
-          void sendOutbound(route, visible)
+          void sendOutbound(route, remembered)
         }
         return
       }
@@ -883,8 +896,12 @@ export class Bridge {
     this.disposers.push(this.ctx.on('session/event', onEvent))
   }
 
-  /** 按序发送分块文本（避免乱序与背压）。 */
+  /** 按序发送分块文本（避免乱序与背压）。带发图、发说说的渠道整段处理，避免标记被切开。 */
   async sendChunks(ch, sendTarget, text, max) {
+    if (typeof ch.deliver === 'function') {
+      await ch.deliver(sendTarget, text, max)
+      return
+    }
     for (const chunk of splitForDelivery(text, max)) {
       await ch.send(sendTarget, chunk)
     }
