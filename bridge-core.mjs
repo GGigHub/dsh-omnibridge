@@ -18,6 +18,7 @@ import { fileURLToPath } from 'node:url'
 import { createUserMessage } from './channels/host-packages.mjs'
 import { applyProfileEdit, ingestTurn, renderMemoryNote, retrieveMemory, splitMemoryUpdate } from './channels/qq-memory.mjs'
 import { splitOutbound } from './channels/qq-fish.mjs'
+import { formatBalance, formatSessionStatus } from './channels/usage-report.mjs'
 
 /** 平台 Channel 基类（对标 AstrBot Platform）。 */
 export class Channel {
@@ -76,9 +77,11 @@ export function helpText(config) {
     '/reset — 重置当前会话（清空上下文重新开始）',
     '/sessions — 列出当前桥的会话（管理员）',
     '/switch <id> — 切换活动会话（管理员）',
-    '/status — 当前活动会话',
+    '/status — 当前会话的上下文、token、命中率，并附带账户余额',
+    '/balance — 只看 DeepSeek 账户余额',
     '/gc [分钟] — 清理闲置超时的会话路由（管理员，默认 30 分钟）',
     '/model [provider/]model — 查看/切换模型（管理员，如 /model ai/gpt-5.6-luna）',
+    '/think [关|低|高|最强] — 查看/修改思考强度（管理员，下一条消息生效）',
     '/help — 本帮助',
   ]
   if (config.allowedCommands?.length) {
@@ -98,7 +101,21 @@ function parseAllowList(raw) {
 }
 
 /** 管理员专属命令集（对齐 AstrBot 权限分级）。 */
-const ADMIN_COMMANDS = new Set(['/model', '/gc', '/sessions', '/switch'])
+const ADMIN_COMMANDS = new Set(['/model', '/think', '/gc', '/sessions', '/switch'])
+
+const THINK_LEVELS = new Map([
+  ['关', 'off'],
+  ['关闭', 'off'],
+  ['off', 'off'],
+  ['低', 'low'],
+  ['low', 'low'],
+  ['高', 'high'],
+  ['high', 'high'],
+  ['最强', 'max'],
+  ['max', 'max'],
+])
+
+const THINK_LABELS = { off: '关', low: '低', high: '高', max: '最强' }
 
 /**
  * 唤醒前缀匹配（对齐 AstrBot waking 的前缀模式）：命中最长前缀即剥离。
@@ -675,8 +692,11 @@ export class Bridge {
           return
         }
         case '/status': {
-          const route = this.routes.get(msg.sessionKey)
-          await this.reply(msg, route ? `当前会话：${route.sessionId}` : '当前无会话。发送 /new <提示词> 新建。')
+          await this.handleStatusCommand(msg)
+          return
+        }
+        case '/balance': {
+          await this.reply(msg, await this.readBalanceText())
           return
         }
         case '/gc': {
@@ -687,6 +707,10 @@ export class Bridge {
         }
         case '/model': {
           await this.handleModelCommand(msg, arg)
+          return
+        }
+        case '/think': {
+          await this.handleThinkCommand(msg, arg)
           return
         }
         default:
@@ -752,7 +776,8 @@ export class Bridge {
       model: this.config.agentModel || '?',
     }
     if (!arg) {
-      await this.reply(msg, `当前模型：${current.provider}/${current.model}`)
+      const effort = THINK_LABELS[current.reasoningEffort] || current.reasoningEffort || '默认'
+      await this.reply(msg, `当前模型：${current.provider}/${current.model}，思考强度：${effort}`)
       return
     }
     // 解析 provider/model
@@ -779,12 +804,102 @@ export class Bridge {
       return
     }
     try {
-      await service.saveSelection({ provider, model })
+      await service.saveSelection({
+        provider,
+        model,
+        ...(current.reasoningEffort ? { reasoningEffort: current.reasoningEffort } : {}),
+      })
       this.config.agentProvider = provider
       this.config.agentModel = model
       await this.reply(msg, `✅ 已切换模型：${provider}/${model}（后续会话生效）`)
     } catch (error) {
       await this.reply(msg, `❌ 切换失败：${error instanceof Error ? error.message : String(error)}`)
+    }
+  }
+
+  projection(session, key) {
+    try {
+      const projections = this.ctx.get?.('sessionProjections')
+      if (!session || typeof projections?.stateOf !== 'function') return null
+      return projections.stateOf(session, key) ?? null
+    } catch {
+      return null
+    }
+  }
+
+  async readBalanceText() {
+    try {
+      const account = this.ctx.get?.('deepseekAccount')
+      if (typeof account?.getBalance !== 'function') return '账户余额：当前登录方式读不到'
+      const result = await Promise.race([
+        account.getBalance({
+          version: '0.2.1-rc.3',
+          locale: 'zh-CN',
+          timezoneOffsetSeconds: -new Date().getTimezoneOffset() * 60,
+        }),
+        new Promise((_, reject) => setTimeout(() => reject(new Error('timeout')), 8000)),
+      ])
+      return formatBalance(result)
+    } catch {
+      return '账户余额：暂时读不到'
+    }
+  }
+
+  async handleStatusCommand(msg) {
+    const route = this.routes.get(msg.sessionKey)
+    let agent = null
+    if (route) {
+      try { agent = this.agentRegistry().get(route.sessionId) } catch {}
+    }
+    const chosen = this.modelRoute()
+    const live = agent?.options || {}
+    const provider = typeof live.provider === 'string' ? live.provider : chosen.provider
+    const model = typeof live.model === 'string' ? live.model : chosen.model
+    const effortId = (typeof live.reasoningEffort === 'string' ? live.reasoningEffort : '') || chosen.reasoningEffort
+    const body = formatSessionStatus({
+      sessionId: route?.sessionId,
+      model: provider && model ? `${provider}/${model}` : '',
+      effort: THINK_LABELS[effortId] || effortId || '',
+      usage: this.projection(agent?.session, 'tokenUsage'),
+      pressure: this.projection(agent?.session, 'contextPressure'),
+      breakdown: this.projection(agent?.session, 'contextBreakdown'),
+      stats: this.projection(agent?.session, 'sessionStats'),
+    })
+    await this.reply(msg, `${body}\n\n${await this.readBalanceText()}`)
+  }
+
+  /** 思考强度：/think [关|低|高|最强]。写入默认模型，并让当前这条对话的下一句就用上。 */
+  async handleThinkCommand(msg, arg) {
+    const service = this.ctx.get?.('agentDefaultModel')
+    const current = service?.currentSelection?.() || {}
+    const shown = THINK_LABELS[current.reasoningEffort] || current.reasoningEffort || '默认'
+    if (!arg) {
+      await this.reply(msg, `当前思考强度：${shown}。可发 /think 关、/think 低、/think 高、/think 最强。`)
+      return
+    }
+    const effort = THINK_LEVELS.get(arg.trim().toLowerCase()) || THINK_LEVELS.get(arg.trim())
+    if (!effort) {
+      await this.reply(msg, '用法：/think 关、/think 低、/think 高、/think 最强')
+      return
+    }
+    if (!current.provider || !current.model || !service || typeof service.saveSelection !== 'function') {
+      await this.reply(msg, '当前还读不到默认模型，没法改思考强度。')
+      return
+    }
+    try {
+      await service.saveSelection({ provider: current.provider, model: current.model, reasoningEffort: effort })
+      try {
+        const route = this.routes.get(msg.sessionKey)
+        const agent = route ? this.agentRegistry().get(route.sessionId) : null
+        agent?.session?.append?.('model/selection', {
+          provider: current.provider,
+          model: current.model,
+          reasoningEffort: effort,
+        })
+      } catch {}
+      await this.reply(msg, `已把思考强度改成「${THINK_LABELS[effort]}」。下一条消息就按这个强度想。`)
+    } catch (error) {
+      await this.reply(msg, `修改失败：${error instanceof Error ? error.message : String(error)}`)
     }
   }
 
