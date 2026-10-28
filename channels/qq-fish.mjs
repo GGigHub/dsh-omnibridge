@@ -56,6 +56,43 @@ export function isSystemOutbound(text) {
   return /^[⏳❌⏹⚠️♻️✅💤🤖]/.test(String(text || '').trim())
 }
 
+/** 像 QQ 一样把一段回复拆成几条短消息。报告和系统提示保持一整条。 */
+export function chatBubbles(text) {
+  const raw = String(text || '').trim()
+  if (!raw) return []
+  if (isSystemOutbound(raw) || /累计 token|账户余额|当前会话：|未知命令|命令执行/.test(raw)) return [raw]
+  const pieces = []
+  for (const block of raw.split(/\n+/)) {
+    const line = block.trim()
+    if (!line) continue
+    pieces.push(...splitChatLine(line))
+  }
+  if (pieces.length <= 4) return pieces
+  return [...pieces.slice(0, 3), pieces.slice(3).join('\n')]
+}
+
+function splitChatLine(line) {
+  if (line.length <= 42) return [line]
+  const bits = line.split(/(?<=[。！？!?；])/).map((bit) => bit.trim()).filter(Boolean)
+  if (bits.length <= 1) return [line]
+  const out = []
+  let current = ''
+  for (const bit of bits) {
+    if (bit.length < 4 && current) {
+      current += bit
+      continue
+    }
+    if (current && current.length + bit.length > 42) {
+      out.push(current)
+      current = bit
+    } else {
+      current += bit
+    }
+  }
+  if (current) out.push(current)
+  return out
+}
+
 /** 念出来的句子：去掉表情方括号和常见记号，最多 300 字。 */
 export function spokenForTts(text) {
   const spoken = String(text || '')
@@ -169,11 +206,29 @@ export function toOnebotSegments(text, nameToId) {
   return parts.filter((p) => p.type !== 'text' || p.data.text)
 }
 
-/** 从回复里拆出发图和发说说。标记本身不留给对方看。 */
+const ACTION_TAG_RE = /<(poke|like|remark|recall|notice|file|history|files|album)\b([^>]*)\/>|<(poke|like|remark|recall|notice|file|history|files|album)\b([^>]*)>([\s\S]*?)<\/\3>/gi
+
+function parseAttrs(raw) {
+  const attrs = {}
+  const re = /([A-Za-z_]+)="([^"]*)"/g
+  let match
+  while ((match = re.exec(String(raw || '')))) attrs[match[1].toLowerCase()] = match[2]
+  return attrs
+}
+
+/** 从回复里拆出发图、说说，以及要交给 NapCat 的动作。标记本身不留给对方看。 */
 export function splitOutbound(text) {
   const images = []
+  const actions = []
   let qzone = null
+  ACTION_TAG_RE.lastIndex = 0
   const visible = String(text || '')
+    .replace(ACTION_TAG_RE, (full, singleName, singleAttrs, pairName, pairAttrs, body) => {
+      const type = String(singleName || pairName || '').toLowerCase()
+      if (!type) return full
+      actions.push({ type, attrs: parseAttrs(singleAttrs || pairAttrs), body: String(body || '').trim() })
+      return ''
+    })
     .replace(/<image>([\s\S]*?)<\/image>/gi, (_, body) => {
       const src = String(body || '').trim()
       if (src) images.push(src)
@@ -189,7 +244,81 @@ export function splitOutbound(text) {
     })
     .replace(/\n{3,}/g, '\n\n')
     .trim()
-  return { visible, images, qzone }
+  return { visible, images, qzone, actions }
+}
+
+function messageText(msg) {
+  if (typeof msg?.raw_message === 'string' && msg.raw_message.trim()) return msg.raw_message.replace(/\s+/g, ' ').trim()
+  const message = msg?.message
+  if (typeof message === 'string') return message.replace(/\s+/g, ' ').trim()
+  if (!Array.isArray(message)) return ''
+  return message.map((seg) => {
+    if (seg?.type === 'text') return seg.data?.text || ''
+    if (seg?.type === 'image') return '[图片]'
+    if (seg?.type === 'record') return '[语音]'
+    if (seg?.type === 'face') return '[表情]'
+    if (seg?.type === 'at') return `@${seg.data?.qq || ''}`
+    if (seg?.type === 'file') return `[文件 ${seg.data?.name || seg.data?.file || ''}]`
+    return ''
+  }).join('').replace(/\s+/g, ' ').trim()
+}
+
+/** 把历史消息收成给她看的短名单，最多 30 行。 */
+export function formatHistory(data) {
+  const messages = Array.isArray(data?.messages) ? data.messages : []
+  if (!messages.length) return '没有翻到更早的聊天记录。'
+  const lines = messages.slice(-30).map((msg) => {
+    const name = msg?.sender?.card || msg?.sender?.nickname || msg?.sender?.user_id || '某人'
+    const text = messageText(msg).slice(0, 80)
+    const id = msg?.message_id != null ? ` #${msg.message_id}` : ''
+    return `${name}${id}：${text || '[非文字]'}`
+  })
+  return `最近聊天：\n${lines.join('\n')}`
+}
+
+function formatSize(n) {
+  const size = Number(n) || 0
+  if (size >= 1048576) return `${(size / 1048576).toFixed(1)} MB`
+  if (size >= 1024) return `${Math.round(size / 1024)} KB`
+  return `${size} B`
+}
+
+/** 群文件根目录。keyword 有的话优先列出名字里带它的。 */
+export function formatFileList(data, keyword = '') {
+  const files = Array.isArray(data?.files) ? data.files : []
+  const folders = Array.isArray(data?.folders) ? data.folders : []
+  const lines = [
+    ...folders.map((folder) => `文件夹 ${folder.folder_name || folder.name || '未命名'}`),
+    ...files.map((file) => `${file.file_name || file.name || '未命名'}（${formatSize(file.file_size || file.size)}）`),
+  ]
+  const query = String(keyword || '').trim()
+  const filtered = query ? lines.filter((line) => line.includes(query)) : lines
+  const shown = (filtered.length ? filtered : lines).slice(0, 20)
+  if (!shown.length) return '群文件是空的。'
+  return `群文件：\n${shown.join('\n')}`
+}
+
+/** 群相册名单。 */
+export function formatAlbumList(data) {
+  const albums = Array.isArray(data?.album_list) ? data.album_list : []
+  if (!albums.length) return '这个群没有相册。'
+  const lines = albums.slice(0, 20).map((album) => {
+    const name = album.album_name || '未命名'
+    const id = album.album_id ? `（编号 ${album.album_id}）` : ''
+    return `${name}${id}`
+  })
+  return `群相册：\n${lines.join('\n')}`
+}
+
+/** 某个相册里的照片地址，最多 8 张。 */
+export function formatAlbumMedia(name, data) {
+  const list = Array.isArray(data) ? data : (data?.media_list || data?.response?.media_list || [])
+  if (!list.length) return `相册「${name}」里没有照片。`
+  const lines = list.slice(0, 8).map((media, index) => {
+    const url = media?.url || media?.cover_url || ''
+    return `${index + 1}. ${url || media?.media_id || '一张照片'}`
+  })
+  return `相册「${name}」：\n${lines.join('\n')}`
 }
 
 /** NapCat 能发出去的图：网址、base64，或本机路径。 */

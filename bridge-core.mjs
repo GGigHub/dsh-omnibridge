@@ -467,6 +467,7 @@ export class Bridge {
     // 路由到 agent
     const route = this.routeFor(msg)
     route.lastActive = Date.now()
+    route.lookupTurns = 0
     // 每条入站刷新 reply token（如 LINE 的一次性 replyToken，随消息更新）
     if (msg.replyToken || msg.raw?.replyToken) {
       route.replyToken = msg.replyToken || msg.raw?.replyToken
@@ -546,6 +547,78 @@ export class Bridge {
     return agents
   }
 
+  /** 早期 QQ 会话没选桌面版那套工具，预设是空的。读不到时不要误判。 */
+  agentLacksPreset(agent) {
+    try {
+      const projections = this.ctx.get?.('sessionProjections')
+      if (!agent?.session || typeof projections?.stateOf !== 'function') return false
+      const preset = projections.stateOf(agent.session, 'agentPreset')
+      return preset === null || preset === ''
+    } catch {
+      return false
+    }
+  }
+
+  samePath(a, b) {
+    const norm = (p) => String(p || '').replace(/[\\/]+$/, '').replace(/\//g, '\\').toLowerCase()
+    return norm(a) === norm(b)
+  }
+
+  /** 工作目录改过之后，旧会话还停在原来的文件夹。 */
+  agentCwdMismatch(agent) {
+    const want = String(this.config.cwd || '').trim()
+    if (!want) return false
+    try {
+      const projections = this.ctx.get?.('sessionProjections')
+      if (!agent?.session || typeof projections?.stateOf !== 'function') return false
+      const current = projections.stateOf(agent.session, 'workingDirectory')
+      if (current == null || current === '') return true
+      return !this.samePath(current, want)
+    } catch {
+      return false
+    }
+  }
+
+  /** 只写了预设名字、没有真正装上搜索和命令。 */
+  agentPresetUnmounted(agent) {
+    try {
+      const presets = this.ctx.get?.('agentPresets')
+      if (!agent?.ctx || typeof presets?.composedPreset !== 'function') return false
+      const bound = presets.composedPreset(agent.ctx)
+      return bound == null || bound === ''
+    } catch {
+      return false
+    }
+  }
+
+  async presetSetup(presetId) {
+    const presets = this.ctx.get?.('agentPresets')
+    if (typeof presets?.mount !== 'function') return null
+    let id = presetId
+    try {
+      const resolved = await presets.resolve?.(presetId)
+      if (resolved?.id) id = resolved.id
+    } catch {
+      id = undefined
+    }
+    return async (agentCtx, agent) => {
+      await presets.mount(agentCtx, id)
+    }
+  }
+
+  /** QQ 用桌面版里「完全访问、不再每次询问」那一档，查网页和跑命令不用等人点允许。 */
+  grantQqPermissions(agent) {
+    try {
+      const permissions = this.ctx.get?.('permissionPresets')
+      if (!agent?.session || typeof permissions?.set !== 'function') return
+      const state = this.ctx.get?.('sessionProjections')?.stateOf?.(agent.session, 'permissions')
+      if (state?.preset === 'danger-full-access' && state?.approval === 'never') return
+      permissions.set(agent.session, 'danger-full-access')
+    } catch (error) {
+      this.ctx.logger?.warn?.('[dsh-omnibridge] QQ 权限没能放开: %s', error instanceof Error ? error.message : String(error))
+    }
+  }
+
   // 人格模板要读模型名。QQ 会话没写上模型时，整句会报 {{model}} 没有值。
   modelRoute() {
     if (this.config.agentProvider && this.config.agentModel) {
@@ -570,14 +643,21 @@ export class Bridge {
   async ensureAgent(route) {
     if (route.agentPromise) return route.agentPromise
     const existing = this.agentRegistry().get(route.sessionId)
-    if (this.agentUsable(existing)) return existing
-    // 旧会话被归档或删掉后，不拆掉它，只给这条 QQ 另开一个新编号。
-    if (existing || route.createdId || this.sessionArchived(route.sessionId)) this.retarget(route)
+    const lacksPreset = this.agentUsable(existing) && this.agentLacksPreset(existing)
+    const unmounted = this.agentUsable(existing) && this.agentPresetUnmounted(existing)
+    const wrongDir = this.agentUsable(existing) && this.agentCwdMismatch(existing)
+    if (this.agentUsable(existing) && !lacksPreset && !unmounted && !wrongDir) {
+      if (route.channelId === 'onebot') this.grantQqPermissions(existing)
+      return existing
+    }
+    // 旧会话被归档、删掉，工具没装上，或工作目录不对时，另开一个新编号。
+    if (existing || lacksPreset || unmounted || wrongDir || route.createdId || this.sessionArchived(route.sessionId)) this.retarget(route)
     const chosen = this.modelRoute()
     const p = (async () => {
-      const meta = {}
+      const presetId = this.config.agentPreset || 'standard'
+      const meta = { agentPreset: presetId }
       if (this.config.cwd) meta.cwd = this.config.cwd
-      if (this.config.agentPreset) meta.agentPreset = this.config.agentPreset
+      const setup = await this.presetSetup(presetId)
       let lastError
       for (let attempt = 0; attempt < 2; attempt++) {
         try {
@@ -585,13 +665,19 @@ export class Bridge {
             sessionId: route.sessionId,
             meta,
             agentOptions: chosen,
+            ...(setup ? { setup } : {}),
           })
           route.createdId = String(handle?.agent?.id || handle?.id || route.sessionId)
-          return this.agentRegistry().get(route.sessionId) || handle?.agent
+          const agent = this.agentRegistry().get(route.sessionId) || handle?.agent
+          if (route.channelId === 'onebot') this.grantQqPermissions(agent)
+          return agent
         } catch (error) {
           lastError = error
           const agent = this.agentRegistry().get(route.sessionId)
-          if (this.agentUsable(agent)) return agent
+          if (this.agentUsable(agent)) {
+            if (route.channelId === 'onebot') this.grantQqPermissions(agent)
+            return agent
+          }
           this.retarget(route)
         }
       }
@@ -964,7 +1050,20 @@ export class Bridge {
         route.replyToken = null
       }
       try {
-        await this.sendChunks(ch, sendTarget, text, this.config.maxMessageChars || 2000)
+        const outcome = await this.sendChunks(ch, sendTarget, text, this.config.maxMessageChars || 2000)
+        if (outcome?.followup && (route.lookupTurns || 0) < 1) {
+          route.lookupTurns = 1
+          let agent = null
+          try { agent = this.agentRegistry().get(route.sessionId) } catch {}
+          if (agent?.followup) {
+            agent.followup(await createUserMessage({
+              content: [{ type: 'text', text: outcome.followup }],
+              source: { kind: 'user' },
+            }))
+          } else if (outcome.lookup) {
+            await ch.send(sendTarget, String(outcome.lookup).slice(0, 1500))
+          }
+        }
       } catch (error) {
         this.ctx.logger?.warn?.('[dsh-omnibridge] outbound send failed: %s', error instanceof Error ? error.message : String(error))
       }
@@ -1013,10 +1112,7 @@ export class Bridge {
 
   /** 按序发送分块文本（避免乱序与背压）。带发图、发说说的渠道整段处理，避免标记被切开。 */
   async sendChunks(ch, sendTarget, text, max) {
-    if (typeof ch.deliver === 'function') {
-      await ch.deliver(sendTarget, text, max)
-      return
-    }
+    if (typeof ch.deliver === 'function') return await ch.deliver(sendTarget, text, max)
     for (const chunk of splitForDelivery(text, max)) {
       await ch.send(sendTarget, chunk)
     }

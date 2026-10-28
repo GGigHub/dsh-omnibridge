@@ -1,8 +1,13 @@
 import assert from 'node:assert/strict'
 import test from 'node:test'
 import {
+  formatAlbumList,
+  formatAlbumMedia,
+  formatFileList,
+  formatHistory,
   identityNote,
   isSendableImage,
+  chatBubbles,
   isSystemOutbound,
   loadFaceMap,
   parseOnebotMessage,
@@ -71,6 +76,30 @@ test('发图和说说的标记不会留在聊天文字里', () => {
   assert.equal(split.qzone, '今天的云')
   assert.equal(isSendableImage('https://example.com/a.png'), true)
   assert.equal(isSendableImage('不是图'), false)
+})
+
+test('动作标记从聊天文字里拿走，查询结果收成短名单', () => {
+  const split = splitOutbound('好<poke/>\n<like times="3">2711686331</like>\n<history>20</history>\n<files/>')
+  assert.equal(split.visible, '好')
+  assert.deepEqual(split.actions.map((item) => item.type), ['poke', 'like', 'history', 'files'])
+  assert.equal(split.actions[1].attrs.times, '3')
+  assert.equal(split.actions[1].body, '2711686331')
+  const history = formatHistory({
+    messages: [{ sender: { nickname: '哥' }, message_id: 9, raw_message: '在吗' }],
+  })
+  assert.match(history, /哥 #9：在吗/)
+  const files = formatFileList({ files: [{ file_name: '计划.pdf', file_size: 2048 }] }, '计划')
+  assert.match(files, /计划\.pdf/)
+  assert.match(formatAlbumList({ album_list: [{ album_name: '出游', album_id: 'a1' }] }), /出游/)
+  assert.match(formatAlbumMedia('出游', { media_list: [{ url: 'https://example.com/1.jpg' }] }), /example\.com\/1\.jpg/)
+})
+
+test('闲聊拆成几条短消息，报告仍是一整条', () => {
+  assert.deepEqual(chatBubbles('在的\n\n今天想聊啥'), ['在的', '今天想聊啥'])
+  const long = '我刚把你上次说的那件事又想了一遍。觉得你可以先歇会儿，不用今晚就做完。我在这儿，你想聊再叫我。'
+  assert.ok(chatBubbles(long).length >= 2)
+  assert.equal(chatBubbles('当前会话：onebot-1\n累计 token：输入 1').length, 1)
+  assert.equal(chatBubbles('✅ 已切换模型').length, 1)
 })
 
 test('数组消息里的语音和引用号能拆出来', () => {

@@ -117,6 +117,102 @@
 
       function Pill(props) { return h('span', { style: props.on ? S.pillOn : S.pillOff }, props.text) }
 
+      /** 下拉不用系统白菜单，跟当前窗口的底色走。 */
+      function EnumSelect(props) {
+        var options = props.spec.options || []
+        var value = props.value
+        var onChange = props.onChange
+        var openState = React.useState(false)
+        var open = openState[0], setOpen = openState[1]
+        var placeState = React.useState(null)
+        var place = placeState[0], setPlace = placeState[1]
+        var btnRef = React.useRef(null)
+        var picked = null
+        for (var i = 0; i < options.length; i++) if (options[i].value === value) picked = options[i]
+        if (!picked && options.length) picked = options[0]
+        function opaqueBackground(node) {
+          var el = node
+          while (el) {
+            var color = window.getComputedStyle(el).backgroundColor
+            var match = /rgba?\(\s*(\d+)\s*,\s*(\d+)\s*,\s*(\d+)(?:\s*,\s*([\d.]+))?\s*\)/.exec(color || '')
+            var alpha = !match ? 1 : (match[4] == null ? 1 : Number(match[4]))
+            if (match && alpha >= 0.9) return color
+            el = el.parentElement
+          }
+          return ''
+        }
+        function toggle() {
+          if (open) { setOpen(false); return }
+          var node = btnRef.current
+          if (!node) return
+          var rect = node.getBoundingClientRect()
+          var text = window.getComputedStyle(node).color
+          var rgb = /rgba?\(\s*(\d+)\s*,\s*(\d+)\s*,\s*(\d+)/.exec(text || '')
+          var light = !rgb || ((Number(rgb[1]) + Number(rgb[2]) + Number(rgb[3])) / 3) > 140
+          setPlace({
+            top: rect.bottom + 4,
+            left: rect.left,
+            width: rect.width,
+            color: text,
+            background: opaqueBackground(node.parentElement) || (light ? '#2c2c2e' : '#f4f4f5'),
+          })
+          setOpen(true)
+        }
+        React.useEffect(function () {
+          if (!open) return undefined
+          function onDoc(event) {
+            var root = btnRef.current && btnRef.current.parentElement
+            if (root && root.contains(event.target)) return
+            setOpen(false)
+          }
+          document.addEventListener('mousedown', onDoc)
+          return function () { document.removeEventListener('mousedown', onDoc) }
+        }, [open])
+        return h('div', { style: { position: 'relative' } },
+          h('button', {
+            ref: btnRef,
+            type: 'button',
+            style: Object.assign({}, S.input, { textAlign: 'left', cursor: 'pointer' }),
+            onClick: toggle,
+          }, (picked ? picked.label : '') + '  ▾'),
+          open && place ? h('div', {
+            style: {
+              position: 'fixed',
+              zIndex: 80,
+              top: place.top,
+              left: place.left,
+              width: place.width,
+              background: place.background,
+              color: place.color,
+              border: '1px solid rgba(127,127,127,.4)',
+              borderRadius: '8px',
+              boxShadow: '0 10px 28px rgba(0,0,0,.45)',
+              padding: '4px',
+            },
+          }, options.map(function (option) {
+            var on = picked && option.value === picked.value
+            return h('button', {
+              key: option.value,
+              type: 'button',
+              style: {
+                display: 'block',
+                width: '100%',
+                textAlign: 'left',
+                cursor: 'pointer',
+                border: 'none',
+                borderRadius: '6px',
+                padding: '7px 8px',
+                fontSize: '12.5px',
+                color: 'inherit',
+                background: on ? 'rgba(127,127,127,.28)' : 'transparent',
+              },
+              onMouseEnter: function (event) { if (!on) event.currentTarget.style.background = 'rgba(127,127,127,.16)' },
+              onMouseLeave: function (event) { if (!on) event.currentTarget.style.background = 'transparent' },
+              onClick: function () { onChange(option.value); setOpen(false) },
+            }, option.label)
+          })) : null)
+      }
+
       /** 通用字段输入（bool/number/text/secret/lines）。 */
       function FieldInput(props) {
         var spec = props.spec
@@ -125,6 +221,7 @@
         if (spec.type === 'bool') {
           return h('button', { style: S.switch(!!value), onClick: function () { onChange(!value) } }, value ? '开' : '关')
         }
+        if (spec.type === 'enum') return h(EnumSelect, { spec: spec, value: value, onChange: onChange })
         var type = spec.type === 'number' ? 'number' : (spec.type === 'secret' ? 'password' : 'text')
         if (spec.type === 'lines') {
           return h('textarea', {
@@ -286,7 +383,12 @@
       var CONFIG_GROUPS = [
         {
           key: 'general', title: '通用', desc: '新会话的默认 Agent 参数', topLevel: true, fields: [
-            { f: 'agentPreset', label: 'Agent 预设', ph: 'coding / minimal …' },
+            { f: 'agentPreset', label: 'Agent 预设', type: 'enum', options: [
+              { value: 'standard', label: 'standard · 搜索、改文件、跑命令' },
+              { value: 'minimal', label: 'minimal · 只聊天' },
+              { value: 'ptc', label: 'ptc · 搜索和命令，外加更复杂的调用' },
+              { value: 'cordis', label: 'cordis · 改 DeepSeek 插件用' },
+            ] },
             { f: 'agentProvider', label: 'Provider', ph: '留空=默认' },
             { f: 'agentModel', label: 'Model', ph: '如 nvidia/deepseek-ai/deepseek-v4-flash-0731' },
             { f: 'cwd', label: '工作目录', ph: '/root' },

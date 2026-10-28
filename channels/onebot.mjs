@@ -18,8 +18,13 @@ import { join } from 'node:path'
 import { Channel, InboundMessage, splitForDelivery } from '../bridge-core.mjs'
 import { Reconnector } from './retry.mjs'
 import {
+  formatAlbumList,
+  formatAlbumMedia,
+  formatFileList,
+  formatHistory,
   identityNote,
   isSendableImage,
+  chatBubbles,
   isSystemOutbound,
   loadFaceMap,
   parseOnebotMessage,
@@ -35,6 +40,17 @@ const RPC_TIMEOUT_MS = 8000
 /** 登录信息查询回执上限。 */
 const LOGIN_TIMEOUT_MS = 5000
 const RECORD_TIMEOUT_MS = 30000
+const ACTION_FAIL = {
+  poke: '戳一戳没发出去。',
+  like: '点赞没发出去。',
+  remark: '备注没改成。',
+  recall: '没撤回。',
+  notice: '公告没发出去。',
+  file: '文件没传上去。',
+  history: '聊天记录没翻到。',
+  files: '群文件没列出来。',
+  album: '群相册没打开。',
+}
 
 const faces = loadFaceMap()
 
@@ -49,6 +65,8 @@ export class OneBotChannel extends Channel {
     this.closed = false
     /** target → 下一句真人回复要不要配语音条 */
     this.voiceTargets = new Set()
+    /** 同一聊天里连着发来的几句，等对方停一下再一起交给她。 */
+    this.inbox = new Map()
   }
 
   get url() {
@@ -164,7 +182,7 @@ export class OneBotChannel extends Channel {
     if (this.config.voiceReply !== false && wantsVoiceReply(text)) this.voiceTargets.add(target)
     const sessionKey = isGroup ? `qq-group:${data.group_id}` : `qq-private:${senderId}`
     const senderName = data.sender?.card || data.sender?.nickname || senderId
-    await this.bridge.handleInbound(new InboundMessage({
+    await this.acceptChat(new InboundMessage({
       platform: 'onebot',
       sessionKey,
       senderId,
@@ -173,10 +191,53 @@ export class OneBotChannel extends Channel {
       images: parsed.images.length ? parsed.images : undefined,
       contextNote: [
         identityNote(senderId, senderName, this.config.ownerIds || ['2711686331']),
-        '[能做的事] 发图写 <image>网址或本机路径</image>。发说说写 <qzone>正文</qzone>，配图就把 <image> 放在同一条回复里。群里没点你的话已经记在这个群的记事里，不要主动插话。这些标记不要原样发出来。',
+        '[怎么说话] 像在 QQ 里聊天。用空行分成两三条，每条只说一两句，不要写成一段作文，也不必每句都追问。有时回一个表情就够。对方连着发来的几句是同一次。查天气、新闻、网页这些实时信息，用你已有的搜索工具去查，不要说自己不能联网。',
+        '[改代码] 主人让你改代码、加功能、修问题时，在当前工作目录里看文件、改文件、跑命令。不要说自己不能写文件。改完用一两句说改了哪个文件、怎么看结果。不要把整份代码贴到 QQ。对方指定了别的路径，就去那个路径。',
+        '[能做的事] 对方没让你做就别做。标记不要原样发出来。发图 <image>网址或本机路径</image>。发说说 <qzone>正文</qzone>。撤回 <recall>消息号</recall>。戳一戳 <poke>QQ号</poke>，私聊可写 <poke/>。点赞 <like>QQ号</like>，多次写 <like times="3">QQ号</like>，最多 10。改备注 <remark user="QQ号">备注</remark>，私聊可写 <remark>备注</remark>。群公告 <notice>正文</notice>。传文件 <file>本机路径或网址</file>。看最近聊天 <history>20</history>。看群文件 <files/>，要下载地址就写 <files>文件名</files>。看群相册 <album/>，看某个相册 <album>相册名</album>。群里没点你的话已经记在这个群的记事里，不要主动插话。',
       ].join('\n'),
       raw: { target, messageId: data.message_id },
-    })).catch(() => {})
+    }))
+  }
+
+  /** 连发的几句合成一次。以 / 开头的命令不等。 */
+  async acceptChat(msg) {
+    const text = String(msg.text || '').trim()
+    if (text.startsWith('/')) {
+      await this.flushInbox(msg.sessionKey)
+      await this.bridge?.handleInbound(msg)
+      return
+    }
+    let bucket = this.inbox.get(msg.sessionKey)
+    if (!bucket) {
+      bucket = { timer: null, msgs: [] }
+      this.inbox.set(msg.sessionKey, bucket)
+    }
+    bucket.msgs.push(msg)
+    clearTimeout(bucket.timer)
+    bucket.timer = setTimeout(() => { void this.flushInbox(msg.sessionKey) }, 1200)
+  }
+
+  async flushInbox(key) {
+    const bucket = this.inbox.get(key)
+    if (!bucket) return
+    clearTimeout(bucket.timer)
+    this.inbox.delete(key)
+    const msgs = bucket.msgs
+    if (!msgs.length) return
+    const last = msgs[msgs.length - 1]
+    const text = msgs.map((item) => String(item.text || '').trim()).filter(Boolean).join('\n')
+    const images = msgs.flatMap((item) => item.images || [])
+    await this.bridge?.handleInbound(new InboundMessage({
+      platform: last.platform,
+      sessionKey: last.sessionKey,
+      senderId: last.senderId,
+      senderName: last.senderName,
+      text,
+      images: images.length ? images : undefined,
+      contextNote: last.contextNote,
+      replyToken: last.replyToken,
+      raw: last.raw,
+    }))
   }
 
   async replyTargetsSelf(messageId) {
@@ -218,13 +279,27 @@ export class OneBotChannel extends Channel {
     return null
   }
 
-  /** 整段回复：先发说说和图片，再把剩下的文字分段发出。 */
+  /** 整段回复：先做戳一戳、点赞这些动作，再发说说和图片，剩下的文字分段发出。查记录时不把原文发给对方，交给下一句来讲。 */
   async deliver(target, text, max = 2000) {
-    const { visible, images, qzone } = splitOutbound(text)
+    const { visible, images, qzone, actions } = splitOutbound(text)
     const [kind, id] = String(target).split(':')
     if (!id) throw new Error(`无效 target: ${target}`)
     const action = kind === 'group' ? 'send_group_msg' : 'send_private_msg'
     const who = kind === 'group' ? { group_id: Number(id) } : { user_id: Number(id) }
+    const acks = []
+    const lookups = []
+    for (const item of actions || []) {
+      try {
+        const result = await this.runAction(kind, id, item)
+        if (result?.lookup) lookups.push(result.lookup)
+        else if (result?.ack) acks.push(result.ack)
+      } catch (error) {
+        this.ctx?.logger?.warn?.('[dsh-omnibridge:onebot] %s 失败: %s', item.type, error instanceof Error ? error.message : String(error))
+        const failed = ACTION_FAIL[item.type] || '这步没做成。'
+        if (item.type === 'history' || item.type === 'files' || item.type === 'album') lookups.push(failed)
+        else acks.push(failed)
+      }
+    }
     const pics = images.filter(isSendableImage)
     let posted = false
     if (qzone) {
@@ -241,7 +316,9 @@ export class OneBotChannel extends Channel {
     const chatImages = posted ? [] : pics
     let body = visible
     if (!body && !chatImages.length && posted) body = '发到空间了。'
-    if (this.voiceTargets.has(target) && body && !isSystemOutbound(body)) {
+    const hold = lookups.length > 0
+    if (!body && !chatImages.length && acks.length && !hold) body = acks.join('\n')
+    if (!hold && this.voiceTargets.has(target) && body && !isSystemOutbound(body)) {
       this.voiceTargets.delete(target)
       const spoken = spokenForTts(body)
       if (spoken) {
@@ -253,23 +330,135 @@ export class OneBotChannel extends Channel {
         }
       }
     }
-    if (body) {
-      const chunks = splitForDelivery(body, max)
-      for (let i = 0; i < chunks.length; i++) {
-        const segments = toOnebotSegments(chunks[i], faces.nameToId) || [{ type: 'text', data: { text: chunks[i] } }]
-        if (i === chunks.length - 1) {
-          for (const file of chatImages) segments.push({ type: 'image', data: { file } })
+    if (!hold && body) {
+      const bubbles = chatBubbles(body)
+      for (let i = 0; i < bubbles.length; i++) {
+        if (bubbles.length > 1 && i > 0) await this.showTyping(kind, id, 400 + Math.min(bubbles[i].length, 40) * 18)
+        const chunks = splitForDelivery(bubbles[i], max)
+        for (let j = 0; j < chunks.length; j++) {
+          const segments = toOnebotSegments(chunks[j], faces.nameToId) || [{ type: 'text', data: { text: chunks[j] } }]
+          if (i === bubbles.length - 1 && j === chunks.length - 1) {
+            for (const file of chatImages) segments.push({ type: 'image', data: { file } })
+          }
+          await this.call(action, { ...who, message: segments })
         }
-        await this.call(action, { ...who, message: segments })
       }
-      return
-    }
-    if (chatImages.length) {
+    } else if (chatImages.length) {
       await this.call(action, {
         ...who,
         message: chatImages.map((file) => ({ type: 'image', data: { file } })),
       })
     }
+    if (!hold) return null
+    const lookup = lookups.join('\n\n')
+    return {
+      lookup,
+      followup: [
+        '[查询结果] 只给你看，不要原样发到 QQ。用口语告诉对方。对方如果要撤回、下载或看某一张照片，可以再写一个对应标记，不要把查询再做一遍。',
+        acks.length ? `已经做完：${acks.join(' ')}` : '',
+        body ? `你刚才准备说的话：${body}` : '',
+        lookup,
+      ].filter(Boolean).join('\n'),
+    }
+  }
+
+  async runAction(kind, id, item) {
+    const group = kind === 'group'
+    const peer = String(id)
+    const body = String(item.body || '').trim()
+    const qqOf = (value) => String(value || '').replace(/\D/g, '')
+    switch (item.type) {
+      case 'poke': {
+        const user = qqOf(body || (group ? '' : peer))
+        if (!user) return { ack: '戳一戳要写对方的 QQ 号。' }
+        if (group) await this.call('send_poke', { group_id: peer, user_id: user })
+        else await this.call('send_poke', { user_id: user })
+        return { ack: '戳了一下。' }
+      }
+      case 'like': {
+        const user = qqOf(body || item.attrs.user || (group ? '' : peer))
+        if (!user) return { ack: '点赞要写对方的 QQ 号。' }
+        let times = Number(item.attrs.times || 1)
+        if (!Number.isFinite(times) || times < 1) times = 1
+        if (times > 10) times = 10
+        await this.call('send_like', { user_id: user, times })
+        return { ack: '点过赞了。' }
+      }
+      case 'remark': {
+        const user = qqOf(item.attrs.user || (group ? '' : peer))
+        const remark = body.slice(0, 60)
+        if (!user || !remark) return { ack: '改备注要有 QQ 号和备注名。' }
+        await this.call('set_friend_remark', { user_id: user, remark })
+        return { ack: '备注改好了。' }
+      }
+      case 'recall': {
+        if (!body) return { ack: '撤回要有消息号。' }
+        await this.call('delete_msg', { message_id: /^\d+$/.test(body) ? Number(body) : body })
+        return { ack: '撤回了。' }
+      }
+      case 'notice': {
+        if (!group) return { ack: '公告只能发在群里。' }
+        if (!body) return { ack: '公告没有内容。' }
+        await this.call('_send_group_notice', { group_id: peer, content: body.slice(0, 1000) })
+        return { ack: '公告发出去了。' }
+      }
+      case 'file': {
+        if (!body) return { ack: '传文件要有路径或网址。' }
+        const name = item.attrs.name || body.split(/[/\\]/).pop() || 'file'
+        if (group) await this.call('upload_group_file', { group_id: peer, file: body, name }, 60000)
+        else await this.call('upload_private_file', { user_id: peer, file: body, name }, 60000)
+        return { ack: '文件传好了。' }
+      }
+      case 'history': {
+        let count = Number(body) || 20
+        if (count < 1) count = 1
+        if (count > 30) count = 30
+        const params = { message_seq: 0, count }
+        const result = group
+          ? await this.call('get_group_msg_history', { group_id: peer, ...params }, 20000)
+          : await this.call('get_friend_msg_history', { user_id: peer, ...params }, 20000)
+        return { lookup: formatHistory(result?.data) }
+      }
+      case 'files': {
+        if (!group) return { lookup: '私聊没有群文件。要传文件就写文件路径。' }
+        const result = await this.call('get_group_root_files', { group_id: peer }, 20000)
+        return { lookup: await this.fileLookup(peer, result?.data, body) }
+      }
+      case 'album': {
+        if (!group) return { lookup: '私聊没有群相册。' }
+        const result = await this.call('get_qun_album_list', { group_id: peer, attach_info: '' }, 20000)
+        return { lookup: await this.albumLookup(peer, result?.data, body) }
+      }
+      default:
+        return null
+    }
+  }
+
+  async fileLookup(groupId, data, keyword) {
+    const text = formatFileList(data, keyword)
+    const files = Array.isArray(data?.files) ? data.files : []
+    const query = String(keyword || '').trim()
+    const hit = query ? files.find((file) => String(file.file_name || file.name || '').includes(query)) : null
+    if (!hit?.file_id) return text
+    try {
+      const url = await this.call('get_group_file_url', { group_id: groupId, file_id: hit.file_id }, 20000)
+      if (url?.data?.url) return `${text}\n「${hit.file_name || hit.name}」的下载地址：${url.data.url}`
+    } catch {}
+    return text
+  }
+
+  async albumLookup(groupId, data, query) {
+    const albums = Array.isArray(data?.album_list) ? data.album_list : []
+    const name = String(query || '').trim()
+    if (!name) return formatAlbumList(data)
+    const hit = albums.find((album) => album.album_id === name || String(album.album_name || '').includes(name))
+    if (!hit?.album_id) return `${formatAlbumList(data)}\n没有名叫「${name}」的相册。`
+    const media = await this.call('get_group_album_media_list', {
+      group_id: groupId,
+      album_id: hit.album_id,
+      attach_info: '',
+    }, 20000)
+    return formatAlbumMedia(hit.album_name || name, media?.data)
   }
 
   /** 发送文本。有表情就改成表情段；这一轮若对方要求语音，再附一条语音。 */
@@ -277,8 +466,15 @@ export class OneBotChannel extends Channel {
     await this.deliver(target, text, this.bridge?.config?.maxMessageChars || 2000)
   }
 
+  async showTyping(kind, id, ms) {
+    if (kind !== 'group') this.call('set_input_status', { user_id: String(id), event_type: 1 }).catch(() => {})
+    await new Promise((resolve) => setTimeout(resolve, ms))
+  }
+
   async stop() {
     this.closed = true
+    for (const bucket of this.inbox.values()) clearTimeout(bucket.timer)
+    this.inbox.clear()
     this.reconnector.close()
     try { this.ws?.close() } catch {}
     for (const p of this.pending.values()) { clearTimeout(p.timer); p.reject(new Error('channel stopped')) }

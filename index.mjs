@@ -14,7 +14,7 @@
  *   dsh-omnibridge:
  *     enabled: true
  *     allowFrom: []            # 必填安全意识：空=拒绝所有入站；'*'=放行所有
- *     agentPreset: coding      # 新会话 agent preset
+ *     agentPreset: standard    # 新会话预设：standard / minimal / ptc / cordis
  *     agentProvider: ~
  *     agentModel: ~
  *     cwd: ~
@@ -85,7 +85,7 @@ export const Config = z.object({
   wakePrefixes: z.array(z.string()).default([]),
   // 入站图片抓取是否放行私网/本机地址（自托管 NapCat/缓存服务可能给局域网链接，开启=信任平台来源）
   mediaAllowPrivateHosts: z.boolean().default(false),
-  agentPreset: z.string().default(''),
+  agentPreset: z.union(['standard', 'minimal', 'ptc', 'cordis']).default('standard'),
   agentProvider: z.string().default(''),
   agentModel: z.string().default(''),
   cwd: z.string().default(''),
