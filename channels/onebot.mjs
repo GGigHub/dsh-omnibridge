@@ -24,7 +24,9 @@ import {
   formatHistory,
   identityNote,
   isSendableImage,
+  bubbleGapMs,
   chatBubbles,
+  inboxWaitMs,
   isSystemOutbound,
   loadFaceMap,
   parseOnebotMessage,
@@ -227,7 +229,7 @@ export class OneBotChannel extends Channel {
     }
     bucket.msgs.push(msg)
     clearTimeout(bucket.timer)
-    bucket.timer = setTimeout(() => { void this.flushInbox(msg.sessionKey) }, 1200)
+    bucket.timer = setTimeout(() => { void this.flushInbox(msg.sessionKey) }, inboxWaitMs(msg.sessionKey))
   }
 
   async flushInbox(key) {
@@ -332,22 +334,22 @@ export class OneBotChannel extends Channel {
     const hold = lookups.length > 0
     if (!body && !chatImages.length && acks.length && !hold) body = acks.join('\n')
     const report = /累计 token|账户余额|当前会话：|未知命令|命令执行/.test(body || '')
+    let voiceP = null
     if (!hold && this.voiceTargets.has(target) && body && !isSystemOutbound(body) && !report) {
       this.voiceTargets.delete(target)
       const spoken = spokenForTts(body)
       if (spoken) {
-        try {
-          const wav = await synthesizeSpeech(spoken, this.config.ttsScript)
-          await this.call(action, { ...who, message: [{ type: 'record', data: { file: wav } }] }, RECORD_TIMEOUT_MS)
-        } catch (error) {
+        voiceP = synthesizeSpeech(spoken, this.config.ttsScript).catch((error) => {
           this.ctx?.logger?.warn?.('[dsh-omnibridge:onebot] 语音回复失败: %s', error instanceof Error ? error.message : String(error))
-        }
+          return ''
+        })
       }
     }
     if (!hold && body) {
       const bubbles = chatBubbles(body)
       for (let i = 0; i < bubbles.length; i++) {
-        if (bubbles.length > 1 && i > 0) await this.showTyping(kind, id, 400 + Math.min(bubbles[i].length, 40) * 18)
+        const gap = i > 0 ? bubbleGapMs(kind, bubbles[i]) : 0
+        if (gap) await this.showTyping(kind, id, gap)
         const chunks = splitForDelivery(bubbles[i], max)
         for (let j = 0; j < chunks.length; j++) {
           const segments = toOnebotSegments(chunks[j], faces.nameToId) || [{ type: 'text', data: { text: chunks[j] } }]
@@ -362,6 +364,16 @@ export class OneBotChannel extends Channel {
         ...who,
         message: chatImages.map((file) => ({ type: 'image', data: { file } })),
       })
+    }
+    if (voiceP) {
+      const wav = await voiceP
+      if (wav) {
+        try {
+          await this.call(action, { ...who, message: [{ type: 'record', data: { file: wav } }] }, RECORD_TIMEOUT_MS)
+        } catch (error) {
+          this.ctx?.logger?.warn?.('[dsh-omnibridge:onebot] 语音条没发出去: %s', error instanceof Error ? error.message : String(error))
+        }
+      }
     }
     if (!hold) return null
     const lookup = lookups.join('\n\n')

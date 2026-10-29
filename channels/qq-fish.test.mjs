@@ -10,7 +10,9 @@ import {
   formatHistory,
   identityNote,
   isSendableImage,
+  bubbleGapMs,
   chatBubbles,
+  inboxWaitMs,
   checkInText,
   isSystemOutbound,
   loadFaceMap,
@@ -135,6 +137,13 @@ test('动作标记从聊天文字里拿走，查询结果收成短名单', () =>
   assert.match(files, /计划\.pdf/)
   assert.match(formatAlbumList({ album_list: [{ album_name: '出游', album_id: 'a1' }] }), /出游/)
   assert.match(formatAlbumMedia('出游', { media_list: [{ url: 'https://example.com/1.jpg' }] }), /example\.com\/1\.jpg/)
+})
+
+test('私聊少等，群里多留一点空档', () => {
+  assert.equal(inboxWaitMs('qq-private:2711686331'), 280)
+  assert.equal(inboxWaitMs('qq-group:123'), 700)
+  assert.equal(bubbleGapMs('private', '你好呀'), 0)
+  assert.ok(bubbleGapMs('group', '你好呀') > 0)
 })
 
 test('闲聊拆成几条短消息，报告仍是一整条', () => {

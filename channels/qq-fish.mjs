@@ -158,6 +158,17 @@ export function isSystemOutbound(text) {
   return /^[⏳❌⏹⚠️♻️✅💤🤖]/.test(String(text || '').trim())
 }
 
+/** 私聊少等一会儿再开口，群里还要给连发留一点空档。 */
+export function inboxWaitMs(sessionKey) {
+  return String(sessionKey || '').startsWith('qq-group:') ? 700 : 280
+}
+
+/** 下一条气泡之间的停顿。私聊不等，群里略停一下。 */
+export function bubbleGapMs(kind, text) {
+  if (kind !== 'group') return 0
+  return 180 + Math.min(String(text || '').length, 24) * 8
+}
+
 /** 像 QQ 一样把一段回复拆成几条短消息。报告和系统提示保持一整条。 */
 export function chatBubbles(text) {
   const raw = String(text || '').trim()
