@@ -1,12 +1,14 @@
 /**
  * 肥鱼的 QQ 身体：用用户填的 NapCat 目录打开 QQ，记住登录过的号。
- * 不下载安装包，不保存密码。快速登录用的是本机 QQ 已经记住的那个号。
+ * 可以从开源发布包准备身体（自带 QQ）。不保存密码。快速登录用本机已经记住的号。
  */
 
-import { execFile, spawn } from 'node:child_process'
-import { appendFileSync, existsSync, mkdirSync, readdirSync, readFileSync, statSync, writeFileSync } from 'node:fs'
+import { execFile, spawn, spawnSync } from 'node:child_process'
+import { appendFileSync, existsSync, mkdirSync, readdirSync, readFileSync, statSync, unlinkSync, writeFileSync } from 'node:fs'
 import { connect } from 'node:net'
 import { dirname, join } from 'node:path'
+import { fileURLToPath } from 'node:url'
+import { bundledBodyDir, cancelInstall, findNamedFile, installProgress } from './napcat-install.mjs'
 
 let job = null
 let phase = ''
@@ -185,6 +187,25 @@ export async function logoutQq() {
   lastError = ''
 }
 
+/** DeepSeek 退出时同步关掉身体，不等待。 */
+export function logoutQqSync() {
+  try { spawnSync('taskkill', ['/F', '/IM', 'NapCatWinBootMain.exe'], { windowsHide: true, timeout: 5000 }) } catch {}
+  try { spawnSync('taskkill', ['/F', '/IM', 'QQ.exe'], { windowsHide: true, timeout: 5000 }) } catch {}
+  runningCache = { at: 0, dir: '' }
+  phase = ''
+  lastError = ''
+}
+
+/** 身体只跟 DeepSeek 走，不再自己开机、自己守着。 */
+export async function releaseIndependentBody() {
+  await execText('schtasks', ['/End', '/TN', 'Dafeiyu NapCat']).catch(() => {})
+  await execText('schtasks', ['/Delete', '/TN', 'Dafeiyu NapCat', '/F']).catch(() => {})
+  const startup = join(process.env.APPDATA || '', 'Microsoft', 'Windows', 'Start Menu', 'Programs', 'Startup', 'Dafeiyu NapCat.vbs')
+  try { if (startup && existsSync(startup)) unlinkSync(startup) } catch {}
+  const script = "Get-CimInstance Win32_Process -Filter \"Name='powershell.exe'\" | Where-Object { $_.CommandLine -match 'keep-alive\\.ps1' } | ForEach-Object { Stop-Process -Id $_.ProcessId -Force -ErrorAction SilentlyContinue }"
+  await execText('powershell.exe', ['-NoProfile', '-WindowStyle', 'Hidden', '-Command', script], 15000).catch(() => {})
+}
+
 export async function switchQqAccount(options) {
   await logoutQq()
   for (let i = 0; i < 12; i += 1) {
@@ -220,8 +241,8 @@ export async function openNapcatWeb(dir) {
   return { ok: true }
 }
 
-export function findNapcatDir({ configured } = {}) {
-  const candidates = [configured]
+export function findNapcatDir({ configured, extra } = {}) {
+  const candidates = [configured, extra]
   for (const dir of candidates) {
     const found = findBoot(dir)
     if (found) return found.dir
@@ -288,26 +309,37 @@ export async function pickNapcatFolder() {
 
 export async function qqBodyStatus({ dataDir, configured, port } = {}) {
   const configuredText = String(configured || '').trim()
-  const savedDir = findNapcatDir({ configured: configuredText })
+  const bundled = dataDir ? bundledBodyDir(dataDir) : ''
+  const savedDir = findNapcatDir({ configured: configuredText, extra: bundled })
   const runningDir = await runningNapcatDir()
   const dir = savedDir || runningDir
   const login = dataDir ? readLogin(dataDir) : { uin: '', nick: '', napcatDir: '' }
   const rememberedBoot = findBoot(login.napcatDir)
   const listening = await portOpen(port || 3001)
   const qqRunning = await processRunning('QQ.exe')
-  const qqExe = await cachedQQExe()
+  const qqExe = await cachedQQExe(dir)
   const qr = dir ? qrInfo(dir) : { fresh: false, at: 0 }
+  let install = installProgress()
+  if (savedDir && install.busy) {
+    cancelInstall()
+    install = installProgress()
+  }
   const view = describeQqBody({
-    configured: !!configuredText || !!runningDir,
-    installed: configuredText ? !!savedDir : !!dir,
+    configured: !!configuredText || !!runningDir || !!savedDir,
+    installed: !!savedDir || !!runningDir,
     listening,
     qqRunning,
     login,
     qrFresh: qr.fresh,
     phase,
   })
+  let label = view.label
+  if (install.phase === 'checking') label = '正在查找身体版本'
+  else if (install.phase === 'downloading') label = install.percent ? `正在下载身体 ${install.percent}%` : '正在连接下载'
+  else if (install.phase === 'unpacking') label = '正在解开身体'
   return {
     ...view,
+    label,
     installed: !!savedDir || !!runningDir,
     listening,
     qqRunning,
@@ -316,12 +348,13 @@ export async function qqBodyStatus({ dataDir, configured, port } = {}) {
     nick: login.nick || '',
     qr: view.state === 'scan' && qr.fresh,
     qrAt: qr.at || 0,
-    error: lastError,
+    error: lastError || install.error,
     napcatDir: dir,
     savedDir,
     runningDir,
     rememberedDir: rememberedBoot ? rememberedBoot.dir : '',
     configured: configuredText,
+    install,
   }
 }
 
@@ -392,8 +425,8 @@ async function runEnsure({ dataDir, configured, uin, fresh, port }) {
 export async function launchNapcat(napcatDir, uin) {
   const boot = findBoot(napcatDir)
   if (!boot) throw new Error('NapCat 没装好')
-  const qqExe = await findQQExe()
-  if (!qqExe || !existsSync(qqExe)) throw new Error('这台电脑上没找到 QQ')
+  const qqExe = await findQQExe(boot.dir)
+  if (!qqExe || !existsSync(qqExe)) throw new Error('身体包里还没有 QQ，点「准备身体」再试。')
   await placeLoader(qqExe, boot.dir)
   const args = napcatLaunchArgs({ qqExe, hookDll: boot.hook, uin })
   const child = spawn(boot.exe, args, {
@@ -408,6 +441,20 @@ export async function launchNapcat(napcatDir, uin) {
       NAPCAT_INJECT_PATH: boot.hook,
       NAPCAT_MAIN_PATH: join(boot.dir, 'napcat.mjs'),
     },
+  })
+  child.unref()
+  hideBootConsole(boot.dir)
+}
+
+function hideBootConsole(napcatDir) {
+  const here = dirname(fileURLToPath(import.meta.url))
+  const script = [join(napcatDir, 'hide-console.vbs'), join(here, 'hide-console.vbs')].find((file) => existsSync(file))
+  if (!script) return
+  const child = spawn('wscript.exe', ['//B', '//nologo', script], {
+    cwd: existsSync(join(napcatDir, 'hide-console.ps1')) ? napcatDir : here,
+    windowsHide: true,
+    stdio: 'ignore',
+    detached: true,
   })
   child.unref()
 }
@@ -426,14 +473,18 @@ async function placeLoader(qqExe, napcatDir) {
   writeFileSync(dest, readFileSync(src))
 }
 
-async function cachedQQExe() {
+async function cachedQQExe(napcatDir) {
+  const bundled = findQqNear(napcatDir)
+  if (bundled) return bundled
   if (Date.now() - qqCache.at < 60000 && qqCache.exe) return qqCache.exe
-  const exe = await findQQExe()
+  const exe = await findQQExe(napcatDir)
   qqCache = { at: Date.now(), exe: exe || '' }
   return qqCache.exe
 }
 
-async function findQQExe() {
+async function findQQExe(napcatDir) {
+  const bundled = findQqNear(napcatDir)
+  if (bundled) return bundled
   try {
     const text = await execText('reg', ['query', 'HKLM\\SOFTWARE\\WOW6432Node\\Microsoft\\Windows\\CurrentVersion\\Uninstall\\QQ', '/v', 'UninstallString'])
     const line = text.split(/\r?\n/).find((item) => /UninstallString/i.test(item)) || ''
@@ -443,6 +494,18 @@ async function findQQExe() {
   } catch {
     return ''
   }
+}
+
+function findQqNear(napcatDir) {
+  let current = String(napcatDir || '').trim()
+  for (let i = 0; i < 3 && current; i += 1) {
+    const hit = findNamedFile(current, 'QQ.exe', 4)
+    if (hit) return hit
+    const parent = dirname(current)
+    if (parent === current) break
+    current = parent
+  }
+  return ''
 }
 
 function qrInfo(dir) {

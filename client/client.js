@@ -1354,6 +1354,12 @@
         var loginLine = !body ? '查看中…' : (ready ? ('已登录' + (who ? ' ' + who : '')) : (body.qr ? '等待扫码' : '未登录'))
         var serviceLine = body ? (body.listening ? '已开' : '没开') : '查看中…'
         var brainLine = link.connected ? '已接上' : (link.reconnecting ? '正在重连' : '未接上')
+        var installBusy = !!(body && body.install && body.install.busy)
+        var installHave = !!(body && body.installed)
+        var installText = '正在下载…'
+        if (installBusy && body.install.phase === 'checking') installText = '正在查找版本…'
+        else if (installBusy && body.install.phase === 'unpacking') installText = '正在解开…'
+        else if (installBusy && body.install.percent) installText = '正在下载 ' + body.install.percent + '%'
         return h('div', null,
           h('div', { style: S.panel },
             h('div', { style: S.title }, '概况'),
@@ -1420,10 +1426,23 @@
               h('input', {
                 style: Object.assign({}, S.input, { flex: '1 1 220px' }),
                 value: dir,
-                placeholder: '点右边选择，或把路径贴在这里',
+                placeholder: '已有的选文件夹；没有就点下面准备身体',
                 onChange: function (event) { dirTouched.current = true; setDir(event.target.value) },
               }),
               h('button', { style: S.btn, disabled: busy, onClick: pick }, '选择文件夹')),
+            installBusy
+              ? h('div', { style: Object.assign({}, S.row, { marginTop: '8px' }) },
+                h('span', { style: S.dim }, installText),
+                h('button', { style: S.btn, onClick: function () { finish(act('cancel-install'), '已取消。') } }, '取消'))
+              : (installHave
+                ? h('div', { style: Object.assign({}, S.dim, { marginTop: '6px' }) }, '身体已经在这个文件夹里，不用再装。')
+                : h('div', { style: Object.assign({}, S.row, { marginTop: '8px' }) },
+                  h('button', {
+                    style: S.btnPrimary,
+                    disabled: busy,
+                    onClick: function () { finish(act('install'), '正在准备身体。') },
+                  }, '准备身体'),
+                  h('span', { style: S.dim }, '下载开源 NapCat，里面带着 QQ。'))),
             suggest ? h('div', { style: Object.assign({}, S.row, { marginTop: '8px' }) },
               h('span', { style: S.dim }, '正在运行的是 ' + body.runningDir),
               h('button', { style: S.btn, disabled: busy, onClick: useRunning }, '改用这个')) : null,
@@ -1463,6 +1482,7 @@
             h('div', { style: Object.assign({}, S.row, { marginTop: '10px', justifyContent: 'space-between' }) },
               h('span', null, '打开 DeepSeek 时自动登录'),
               h('button', { style: S.switch(auto), onClick: function () { setAuto(!auto) } }, auto ? '开' : '关')),
+            h('div', { style: Object.assign({}, S.dim, { marginTop: '6px' }) }, '关掉 DeepSeek 时，NapCat 和这个 QQ 会一起退出，不会再自己留在后台。'),
             h('div', { style: Object.assign({}, S.fieldLabel, { marginTop: '10px' }) }, '端口'),
             h('input', { style: S.input, value: port, onChange: function (event) { setPort(event.target.value.replace(/\D/g, '').slice(0, 5)) } }),
             h('div', { style: Object.assign({}, S.fieldLabel, { marginTop: '10px' }) }, '口令'),

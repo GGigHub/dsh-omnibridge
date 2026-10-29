@@ -15,7 +15,8 @@ import { Bridge } from './bridge-core.mjs'
 import { beginScan, pollScan, wecomKfScan } from './channels/scan-registration.mjs'
 import { OneBotChannel } from './channels/onebot.mjs'
 import { readJsonBody, respondJson } from './channels/http-utils.mjs'
-import { alignDshServer, appendBodyLog, armQqBody, ensureQqBody, findNapcatDir, logoutQq, napcatWebCredential, onebotPort, openNapcatWeb, pickNapcatFolder, qqBodyStatus, qrcodePath, readAccounts, readBodyLog, showQqWindow, splitOnebotUrl, switchQqAccount, writeLogin } from './channels/napcat-body.mjs'
+import { alignDshServer, appendBodyLog, armQqBody, ensureQqBody, findNapcatDir, logoutQq, logoutQqSync, napcatWebCredential, onebotPort, openNapcatWeb, pickNapcatFolder, qqBodyStatus, qrcodePath, readAccounts, readBodyLog, releaseIndependentBody, showQqWindow, splitOnebotUrl, switchQqAccount, writeLogin } from './channels/napcat-body.mjs'
+import { armInstall, bundledBodyDir, cancelInstall, resolveExistingBody } from './channels/napcat-install.mjs'
 import { createReadStream, existsSync as fileExists } from 'node:fs'
 
 const NAMESPACE = 'dsh-omnibridge'
@@ -72,8 +73,8 @@ export const Config = z.object({
     // 私聊默认回一条语音，对方说打字就改回文字。群里仍要明说才念。
     voiceReply: z.boolean().default(true),
     ttsScript: z.string().default(''),
-    // 填了安装目录并打开后，DeepSeek 启动时才拉起 NapCat。
-    autoStart: z.boolean().default(false),
+    // 打开 DeepSeek 时拉起 NapCat。关掉 DeepSeek 时身体一起停。
+    autoStart: z.boolean().default(true),
     napcatDir: z.string().default(''),
     // 留空则用上次登录记住的号。扫码换号时这一次不带号。
     loginUin: z.string().default(''),
@@ -151,6 +152,26 @@ export function apply(ctx, config) {
     watch() { return () => {} },
   }
   let bridge = null
+  let bodyTimer = null
+  let bodyHeldClosed = false
+
+  const stopOwnedBody = () => {
+    if (bodyTimer) { clearInterval(bodyTimer); bodyTimer = null }
+    bodyHeldClosed = true
+    logoutQq().catch(() => {})
+  }
+
+  const watchOwnedBody = (cfg) => {
+    if (bodyTimer) { clearInterval(bodyTimer); bodyTimer = null }
+    if (cfg.onebot?.enabled === false || !cfg.onebot?.napcatDir) return
+    bodyTimer = setInterval(() => {
+      if (bodyHeldClosed) return
+      const live = scope.get()
+      if (live.onebot?.enabled === false || !live.onebot?.napcatDir) return
+      if (live.onebot?.autoStart !== true) return
+      armQqBody(bodyOptions(live))
+    }, 120000)
+  }
 
   // rebuild 串行链：settings 快速连改 / 手动开关会并发触发 startBridge，
   // 若不串行，前一次还在 await old.stop() 时后一次看到 bridge=null 就再建一个，
@@ -164,9 +185,12 @@ export function apply(ctx, config) {
       bridge = new Bridge(ctx, cfg, buildChannels(cfg))
       try {
         await bridge.start()
+        await releaseIndependentBody()
         if (cfg.onebot?.enabled !== false && cfg.onebot?.autoStart === true && cfg.onebot?.napcatDir) {
+          bodyHeldClosed = false
           armQqBody(bodyOptions(cfg))
         }
+        watchOwnedBody(cfg)
       } catch (error) {
         ctx.logger?.error?.('[dsh-omnibridge] bridge start failed: %s', error instanceof Error ? error.stack : String(error))
       }
@@ -179,6 +203,8 @@ export function apply(ctx, config) {
   // settings 变更时重建
   scope.watch(() => startBridge())
   startBridge()
+  try { ctx.on?.('dispose', stopOwnedBody) } catch {}
+  process.once('exit', logoutQqSync)
 
   // 桌面版在 apply 时 webServer 已经在 ctx 上。
   ctx.effect(() => {
@@ -261,6 +287,7 @@ export function apply(ctx, config) {
             const action = String(body.action || 'start')
             const dataDir = qqDataDir()
             if (action === 'logout') {
+              bodyHeldClosed = true
               await logoutQq()
               appendBodyLog(dataDir, '退出登录')
               respondJson(response, 200, await qqView(cfg, bridge))
@@ -283,6 +310,34 @@ export function apply(ctx, config) {
               respondJson(response, 200, await qqView(cfg, bridge))
               return
             }
+            if (action === 'install') {
+              const options = bodyOptions(cfg)
+              const existing = resolveExistingBody(body.napcatDir || options.configured, dataDir)
+              if (existing && !body.force) {
+                cancelInstall()
+                appendBodyLog(dataDir, '身体已经在，不再下载')
+                respondJson(response, 200, { ...(await qqView(cfg, bridge)), skipped: true, napcatDir: existing.dir })
+                return
+              }
+              appendBodyLog(dataDir, '准备身体')
+              armInstall(dataDir, { configured: options.configured, force: !!body.force }).then((result) => {
+                if (!result?.dir || result.skipped) return
+                try { writeLogin(dataDir, { napcatDir: result.dir }) } catch {}
+                const live = scope.get()
+                const onebot = { ...(live.onebot || {}), napcatDir: result.dir }
+                scope.update({ onebot }).catch(() => {})
+              }).catch((error) => {
+                ctx.logger?.warn?.('[dsh-omnibridge] 准备身体失败: %s', error instanceof Error ? error.message : String(error))
+              })
+              respondJson(response, 200, await qqView(cfg, bridge))
+              return
+            }
+            if (action === 'cancel-install') {
+              cancelInstall()
+              appendBodyLog(dataDir, '取消准备身体')
+              respondJson(response, 200, await qqView(cfg, bridge))
+              return
+            }
             if (action === 'probe') {
               const owner = (cfg.onebot?.ownerIds || []).map((item) => String(item || '').trim()).find((item) => /^\d{5,12}$/.test(item)) || ''
               const channel = onebotChannel(bridge)
@@ -299,6 +354,7 @@ export function apply(ctx, config) {
               fresh: !!body.fresh,
             })
             appendBodyLog(dataDir, body.fresh ? '扫码登录' : '用记住的号登录')
+            bodyHeldClosed = false
             if (action === 'switch') await switchQqAccount(options)
             else await ensureQqBody(options)
             respondJson(response, 200, await qqView(cfg, bridge))
@@ -399,9 +455,11 @@ function qqDataDir() {
 
 function bodyOptions(cfg, extra = {}) {
   const onebot = cfg?.onebot || {}
+  const dataDir = qqDataDir()
+  const resolved = findNapcatDir({ configured: onebot.napcatDir || '', extra: bundledBodyDir(dataDir) })
   return {
-    dataDir: qqDataDir(),
-    configured: onebot.napcatDir || '',
+    dataDir,
+    configured: resolved || onebot.napcatDir || '',
     uin: onebot.loginUin || '',
     port: onebotPort(onebot.url),
     ...extra,
@@ -412,7 +470,7 @@ function rememberQqChoice(cfg) {
   const onebot = cfg?.onebot
   if (!onebot || typeof onebot !== 'object') return
   const patch = {}
-  const resolved = findNapcatDir({ configured: onebot.napcatDir || '' })
+  const resolved = findNapcatDir({ configured: onebot.napcatDir || '', extra: bundledBodyDir(qqDataDir()) })
   if (resolved) patch.napcatDir = resolved
   if (/^\d{5,12}$/.test(String(onebot.loginUin || ''))) patch.uin = String(onebot.loginUin)
   if (Object.keys(patch).length) {
