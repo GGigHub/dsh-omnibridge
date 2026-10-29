@@ -411,12 +411,12 @@
         },
         {
           key: 'onebot', title: 'QQ · OneBot v11', desc: 'NapCat / go-cqhttp / Lagrange 正向 WS。表情、语音和群唤醒只作用在这一路', enable: true, fields: [
-            { f: 'url', label: 'WS 地址', type: 'secret', ph: 'ws://127.0.0.1:3001?access_token=…' },
+            { f: 'url', label: 'WS 地址', type: 'secret', ph: 'ws://127.0.0.1:3001?access_token=…', hint: '一般不用改。登录、目录和扫码在「NapCat」页。' },
             { f: 'reconnectDelayMs', label: '重连基间隔（ms）', type: 'number' },
             { f: 'groupAtOnly', label: '群聊需 @ 或喊醒', type: 'bool' },
             { f: 'groupWakeWords', label: '群聊唤醒词', type: 'lines', hint: '喊到这些词也会叫醒她，私聊不用喊' },
             { f: 'ownerIds', label: '主人 QQ', type: 'lines', hint: '这些号在她眼里是主人，对方看不到这行标记' },
-            { f: 'voiceReply', label: '按要求回语音条', type: 'bool' },
+            { f: 'voiceReply', label: '私聊默认回语音', type: 'bool' },
           ],
         },
         {
@@ -1145,12 +1145,8 @@
           h('div', { style: S.title }, '无扫码环节的平台'),
           h('div', { style: Object.assign({}, S.dim, { marginTop: '4px' }) },
             '企业微信 / LINE / 微信公众号 / Telegram / Satori 使用 Token 或 AppId+Secret 鉴权，不存在扫码环节——凭据在「渠道配置」对应平台卡填写即可。飞书 / 钉钉 / QQ 官方已支持上方设备码扫码接入。'),
-          h('div', { style: S.row, marginTop: '8px' },
-            h('button', {
-              style: S.btn,
-              onClick: function () { window.open('http://127.0.0.1:6099', '_blank') },
-            }, 'QQ（NapCat）扫码登录 ↗'),
-            h('span', { style: S.dim }, 'QQ 账号的扫码发生在 NapCat 自身 WebUI（默认 127.0.0.1:6099），登录后本桥直连。')))
+          h('div', { style: Object.assign({}, S.dim, { marginTop: '8px' }) },
+            'QQ 的登录、目录和扫码在「NapCat」页完成。'))
       }
 
       // ————————————————————————— 主面板（settings.section 挂载） —————————————————————————
@@ -1169,27 +1165,330 @@
         }
       }
 
-      function BridgePanel() {
-        var tabSt = React.useState('status')
-        var tab = tabSt[0], setTab = tabSt[1]
-        var tabs = [['status', '运行状态'], ['config', '渠道配置'], ['commands', '内置指令'], ['chat', '聊天测试'], ['qr', '扫码登录']]
-        var body
-        try {
-          body = tab === 'status' ? h(StatusTab)
-            : tab === 'config' ? h(ConfigTab)
-            : tab === 'commands' ? h(CommandsTab)
-            : tab === 'chat' ? h(ChatTab)
-            : h(QrLoginTab)
-        } catch (error) {
-          body = h('div', { style: S.err }, 'tab 渲染异常：' + (error && error.message || String(error)))
+      function NapCatTab() {
+        var cfgSt = React.useState(null)
+        var cfg = cfgSt[0], setCfg = cfgSt[1]
+        var dirSt = React.useState('')
+        var dir = dirSt[0], setDir = dirSt[1]
+        var uinSt = React.useState('')
+        var uin = uinSt[0], setUin = uinSt[1]
+        var autoSt = React.useState(false)
+        var auto = autoSt[0], setAuto = autoSt[1]
+        var cwdSt = React.useState('')
+        var cwd = cwdSt[0], setCwd = cwdSt[1]
+        var presetSt = React.useState('standard')
+        var preset = presetSt[0], setPreset = presetSt[1]
+        var ownerSt = React.useState('')
+        var owners = ownerSt[0], setOwners = ownerSt[1]
+        var allowSt = React.useState('')
+        var allow = allowSt[0], setAllow = allowSt[1]
+        var adminSt = React.useState('')
+        var admins = adminSt[0], setAdmins = adminSt[1]
+        var wakeSt = React.useState(true)
+        var wakeOn = wakeSt[0], setWakeOn = wakeSt[1]
+        var wakeWordSt = React.useState('大肥鱼')
+        var wakeWords = wakeWordSt[0], setWakeWords = wakeWordSt[1]
+        var voiceSt = React.useState(true)
+        var voice = voiceSt[0], setVoice = voiceSt[1]
+        var portSt = React.useState('3001')
+        var port = portSt[0], setPort = portSt[1]
+        var tokenSt = React.useState('')
+        var tokenInput = tokenSt[0], setTokenInput = tokenSt[1]
+        var maxSt = React.useState('2000')
+        var maxChars = maxSt[0], setMaxChars = maxSt[1]
+        var bodySt = React.useState(null)
+        var body = bodySt[0], setBody = bodySt[1]
+        var msgSt = React.useState(null)
+        var msg = msgSt[0], setMsg = msgSt[1]
+        var busySt = React.useState(false)
+        var busy = busySt[0], setBusy = busySt[1]
+        var uinTouched = React.useRef(false)
+        var dirTouched = React.useRef(false)
+
+        function splitList(value) {
+          return String(value || '').split(/\n|,|，/).map(function (item) { return item.trim() }).filter(Boolean)
         }
-        return h(PanelBoundary, null,
-          h('div', null,
-            h('div', { style: { borderBottom: '1px solid rgba(127,127,127,.2)', marginBottom: '10px' } },
-              tabs.map(function (t) {
-                return h('button', { key: t[0], style: S.tabBtn(tab === t[0]), onClick: function () { setTab(t[0]) } }, t[1])
-              })),
-            body))
+        var load = React.useCallback(function () {
+          return fetchJson(SETTINGS_API).then(function (next) {
+            var onebot = next.onebot || {}
+            var portMatch = /:(\d+)/.exec(onebot.url || '')
+            setCfg(next)
+            setAuto(!!onebot.autoStart)
+            setCwd(next.cwd || '')
+            setPreset(next.agentPreset || 'standard')
+            setOwners(Array.isArray(onebot.ownerIds) ? onebot.ownerIds.join('\n') : '')
+            setAllow(Array.isArray(next.allowFrom) ? next.allowFrom.join('\n') : '')
+            setAdmins(Array.isArray(next.admins) ? next.admins.join('\n') : '')
+            setWakeOn(onebot.groupAtOnly !== false)
+            setWakeWords(Array.isArray(onebot.groupWakeWords) && onebot.groupWakeWords.length ? onebot.groupWakeWords.join('、') : '大肥鱼')
+            setVoice(onebot.voiceReply !== false)
+            setPort(portMatch ? portMatch[1] : '3001')
+            setMaxChars(String(next.maxMessageChars || 2000))
+            if (!dirTouched.current) setDir(function (current) { return onebot.napcatDir || current || '' })
+            if (!uinTouched.current) setUin(function (current) { return onebot.loginUin || current || '' })
+          }).catch(function (error) { setMsg({ kind: 'err', text: error.message || String(error) }) })
+        }, [])
+        React.useEffect(function () { load() }, [load])
+        React.useEffect(function () {
+          var stop = false
+          function tick() {
+            fetchJson('/dsh-omnibridge/qq-body').then(function (j) { if (!stop) setBody(j) }).catch(function () {})
+          }
+          tick()
+          var timer = setInterval(tick, 4000)
+          return function () { stop = true; clearInterval(timer) }
+        }, [])
+        React.useEffect(function () {
+          if (uinTouched.current || uin) return
+          if (body && body.uin) setUin(body.uin)
+        }, [body, uin])
+        React.useEffect(function () {
+          if (dirTouched.current || dir) return
+          var found = (body && (body.runningDir || body.rememberedDir)) || ''
+          if (found) setDir(found)
+        }, [body, dir])
+
+        function nextUrl() {
+          var previous = (cfg && cfg.onebot && cfg.onebot.url) || ''
+          var token = tokenInput.trim()
+          if (!token) {
+            var match = /access_token=([^&]*)/.exec(previous)
+            token = match ? decodeURIComponent(match[1]) : ' '
+          }
+          return 'ws://127.0.0.1:' + (Number(port) || 3001) + '?access_token=' + encodeURIComponent(token)
+        }
+        function persist(overrides) {
+          var patch = overrides || {}
+          var loginUin = patch.loginUin != null ? String(patch.loginUin).trim() : uin.trim()
+          var napcatDir = patch.napcatDir != null ? String(patch.napcatDir).trim() : dir.trim()
+          var previousRate = (cfg && cfg.rateLimit) || {}
+          var onebot = Object.assign({}, (cfg && cfg.onebot) || {}, {
+            napcatDir: napcatDir,
+            autoStart: !!auto,
+            loginUin: loginUin,
+            groupAtOnly: !!wakeOn,
+            groupWakeWords: splitList(wakeWords.replace(/、/g, '\n')),
+            ownerIds: splitList(owners),
+            voiceReply: !!voice,
+            url: nextUrl(),
+          })
+          return fetchJson(SETTINGS_API, {
+            method: 'POST',
+            body: JSON.stringify({ patch: {
+              onebot: onebot,
+              cwd: cwd.trim(),
+              agentPreset: preset || 'standard',
+              allowFrom: splitList(allow),
+              admins: splitList(admins),
+              maxMessageChars: Number(maxChars) || 2000,
+              rateLimit: Object.assign({}, previousRate, { maxPerMinute: Number(previousRate.maxPerMinute) || 0 }),
+            } }),
+          }).then(function (next) { setCfg(next); setTokenInput(''); return next })
+        }
+        function act(action, extra) {
+          return fetchJson('/dsh-omnibridge/qq-body', {
+            method: 'POST',
+            body: JSON.stringify(Object.assign({ action: action, napcatDir: dir.trim(), loginUin: uin.trim() }, extra || {})),
+          })
+        }
+        function finish(promise, okText) {
+          if (busy || !cfg) return
+          setBusy(true)
+          setMsg(null)
+          promise.then(function (j) {
+            if (j && j.label) setBody(j)
+            if (j && j.error) setMsg({ kind: 'err', text: j.error })
+            else if (j && j.ok === false) setMsg({ kind: 'err', text: j.error || '没有完成' })
+            else if (okText) setMsg({ kind: 'ok', text: okText })
+          }).catch(function (error) {
+            setMsg({ kind: 'err', text: error.message || String(error) })
+          }).then(function () { setBusy(false) })
+        }
+        function save() {
+          finish(persist().then(function () { return { ok: true } }), dir.trim() ? '已保存。' : '已保存。还没选文件夹，这里还不能登录。')
+        }
+        function login(fresh) {
+          if (!dir.trim()) { setMsg({ kind: 'err', text: '先选择 NapCat 的文件夹。' }); return }
+          var readyNow = body && (body.state === 'ready' || body.qqRunning || body.listening)
+          finish(persist().then(function () {
+            return act(fresh && readyNow ? 'switch' : 'start', { fresh: !!fresh, loginUin: fresh ? '' : uin.trim() })
+          }), fresh ? '正在换号。要扫码的话，二维码会出现在下面。' : '正在登录。')
+        }
+        function useAccount(nextUin) {
+          if (!window.confirm('换成 ' + nextUin + ' 会关掉当前 QQ 窗口。你自己的 QQ 如果开在同一个窗口里，也会一起退出。')) return
+          uinTouched.current = true
+          setUin(nextUin)
+          if (!dir.trim()) { setMsg({ kind: 'err', text: '先选择 NapCat 的文件夹。' }); return }
+          finish(persist({ loginUin: nextUin }).then(function () { return act('switch', { fresh: false, loginUin: nextUin }) }), '正在换成 ' + nextUin + '。')
+        }
+        function logout() {
+          if (!window.confirm('退出后肥鱼会离线。这台电脑的 QQ 是同一个窗口，你自己的 QQ 也会一起退出。记住的号还留着。')) return
+          finish(act('logout'), '已退出。')
+        }
+        function pick() {
+          if (busy) return
+          setBusy(true)
+          setMsg({ kind: 'ok', text: '正在打开文件夹窗口。如果被挡住了，到任务栏点一下。' })
+          fetchJson('/dsh-omnibridge/qq-body/pick', { method: 'POST', body: '{}' }).then(function (j) {
+            if (j && j.dir) { dirTouched.current = true; setDir(j.dir); setMsg({ kind: 'ok', text: '已经选好。点保存。' }) }
+            else if (j && j.canceled) setMsg(null)
+            else setMsg({ kind: 'err', text: (j && j.error) || '没有选到 NapCat' })
+          }).catch(function (error) {
+            setMsg({ kind: 'err', text: error.message || String(error) })
+          }).then(function () { setBusy(false) })
+        }
+        function useRunning() {
+          if (!body || !body.runningDir) return
+          dirTouched.current = true
+          setDir(body.runningDir)
+          finish(persist({ napcatDir: body.runningDir }), '已改用正在运行的那个目录。')
+        }
+
+        var link = (body && body.link) || {}
+        var ready = body && body.state === 'ready'
+        var who = body && body.uin ? ((body.nick ? body.nick + ' · ' : '') + body.uin) : ''
+        var suggest = body && body.runningDir && body.runningDir !== dir.trim()
+        var accounts = (body && body.accounts) || []
+        var heard = link.lastHeard
+        var qqLine = body ? (body.state === 'starting' ? '正在打开' : (body.qqRunning ? '窗口在' : '没开')) : '查看中…'
+        var loginLine = !body ? '查看中…' : (ready ? ('已登录' + (who ? ' ' + who : '')) : (body.qr ? '等待扫码' : '未登录'))
+        var serviceLine = body ? (body.listening ? '已开' : '没开') : '查看中…'
+        var brainLine = link.connected ? '已接上' : (link.reconnecting ? '正在重连' : '未接上')
+        return h('div', null,
+          h('div', { style: S.panel },
+            h('div', { style: S.title }, '概况'),
+            h('div', { style: Object.assign({}, S.dim, { margin: '4px 0 8px' }) }, 'DeepSeek 是她本人。这一页是她的身体。你在 QQ 里跟她说话。'),
+            infoLine('QQ', qqLine),
+            infoLine('登录', loginLine),
+            infoLine('服务', serviceLine),
+            infoLine('DeepSeek', brainLine),
+            body && body.webToken ? h('div', { style: Object.assign({}, S.row, { padding: '3px 0' }) },
+              h('span', { style: { opacity: .6, minWidth: '110px', fontSize: '12px' } }, '网页登录口令'),
+              h('span', { style: Object.assign({}, S.mono, { wordBreak: 'break-all' }) }, body.webToken),
+              h('button', {
+                style: S.btn,
+                onClick: function () {
+                  var text = body.webToken
+                  if (navigator.clipboard && navigator.clipboard.writeText) navigator.clipboard.writeText(text).then(function () {
+                    setMsg({ kind: 'ok', text: '网页登录口令已复制。' })
+                  }).catch(function () { setMsg({ kind: 'err', text: '没有复制成功，请手动选中这段口令。' }) })
+                },
+              }, '复制')) : h('div', { style: Object.assign({}, S.dim, { marginTop: '4px' }) }, '还没找到网页登录口令。先选好 NapCat 文件夹。'),
+            h('div', { style: Object.assign({}, S.dim, { marginTop: '2px' }) }, '点打开网页会直接进入。如果还停在登录页，把上面这段贴进 Token。'),
+            body && body.listening && !link.connected ? h('div', { style: Object.assign({}, S.dim, { marginTop: '4px' }) }, 'QQ 已经开着，DeepSeek 还没接上。点重新连接。') : null,
+            body && body.error ? h('div', { style: Object.assign({}, S.err, { marginTop: '6px' }) }, body.error) : null,
+            h('div', { style: Object.assign({}, S.row, { marginTop: '10px' }) },
+              h('button', { style: S.btn, disabled: busy, onClick: function () { finish(act('reconnect'), '正在重新连接。') } }, '重新连接'),
+              h('button', { style: S.btn, disabled: busy, onClick: function () { finish(act('show'), '已把 QQ 窗口调到前面。') } }, '显示窗口'),
+              h('button', { style: S.btn, disabled: busy, onClick: function () { finish(act('web'), '已在浏览器打开。') } }, '打开网页'),
+              h('button', { style: S.btnDanger, disabled: busy, onClick: logout }, '退出登录'))),
+          h('div', { style: S.panel },
+            h('div', { style: Object.assign({}, S.row, { justifyContent: 'space-between' }) },
+              h('span', { style: S.title }, '登录'),
+              h(Pill, { on: !!ready, text: (body && body.label) || '查看中…' })),
+            ready
+              ? h('div', { style: { marginTop: '8px', fontSize: '15px', fontWeight: 700 } }, who || 'QQ 已连上')
+              : h('div', { style: Object.assign({}, S.dim, { marginTop: '6px' }) }, '用记住的号进入，或在这里扫码。登录过的号会出现在下面。'),
+            body && body.qr ? h('div', { style: { marginTop: '10px' } },
+              h('img', {
+                alt: 'QQ 登录二维码',
+                src: '/dsh-omnibridge/qq-body/qrcode?bust=' + body.qrAt,
+                style: { width: '180px', height: '180px', background: '#fff', borderRadius: '8px' },
+              }),
+              h('div', { style: Object.assign({}, S.dim, { marginTop: '4px' }) }, '用手机 QQ 扫这个码。扫完这里会变成已登录。')) : null,
+            accounts.length ? h('div', { style: { marginTop: '8px' } },
+              h('div', { style: S.fieldLabel }, '登录过的号'),
+              h('div', { style: S.row }, accounts.map(function (item) {
+                var label = (item.nick ? item.nick + ' · ' : '') + item.uin
+                return h('button', { key: item.uin, style: S.chip, disabled: busy, onClick: function () { useAccount(item.uin) } }, label)
+              }))) : null,
+            h('div', { style: Object.assign({}, S.row, { marginTop: '10px' }) },
+              ready ? null : h('button', {
+                style: Object.assign({}, S.btnPrimary, (busy || !dir.trim()) ? { opacity: .5 } : null),
+                disabled: busy || !dir.trim(),
+                onClick: function () { login(false) },
+              }, uin.trim() ? '用这个号登录' : '登录'),
+              h('button', {
+                style: Object.assign({}, S.btn, (busy || !dir.trim()) ? { opacity: .5 } : null),
+                disabled: busy || !dir.trim(),
+                onClick: function () { login(true) },
+              }, '扫码登录'))),
+          h('div', { style: S.panel },
+            h('div', { style: S.title }, '配置'),
+            h('div', { style: S.fieldLabel }, 'NapCat 文件夹'),
+            h('div', { style: S.row },
+              h('input', {
+                style: Object.assign({}, S.input, { flex: '1 1 220px' }),
+                value: dir,
+                placeholder: '点右边选择，或把路径贴在这里',
+                onChange: function (event) { dirTouched.current = true; setDir(event.target.value) },
+              }),
+              h('button', { style: S.btn, disabled: busy, onClick: pick }, '选择文件夹')),
+            suggest ? h('div', { style: Object.assign({}, S.row, { marginTop: '8px' }) },
+              h('span', { style: S.dim }, '正在运行的是 ' + body.runningDir),
+              h('button', { style: S.btn, disabled: busy, onClick: useRunning }, '改用这个')) : null,
+            h('div', { style: Object.assign({}, S.fieldLabel, { marginTop: '10px' }) }, '登录的 QQ 号'),
+            h('input', {
+              style: S.input,
+              value: uin,
+              placeholder: '留空就扫码',
+              onChange: function (event) { uinTouched.current = true; setUin(event.target.value.replace(/\D/g, '').slice(0, 12)) },
+            }),
+            h('div', { style: Object.assign({}, S.fieldLabel, { marginTop: '10px' }) }, '工作目录'),
+            h('input', { style: S.input, value: cwd, placeholder: '她改代码时用的文件夹', onChange: function (event) { setCwd(event.target.value) } }),
+            h('div', { style: Object.assign({}, S.fieldLabel, { marginTop: '10px' }) }, '她怎么干活'),
+            h(EnumSelect, {
+              spec: { options: [
+                { value: 'standard', label: 'standard · 搜索、改文件、跑命令' },
+                { value: 'minimal', label: 'minimal · 只聊天' },
+                { value: 'ptc', label: 'ptc · 搜索和命令，外加更复杂的调用' },
+                { value: 'cordis', label: 'cordis · 改 DeepSeek 插件用' },
+              ] },
+              value: preset,
+              onChange: setPreset,
+            }),
+            h('div', { style: Object.assign({}, S.fieldLabel, { marginTop: '10px' }) }, '主人 QQ'),
+            h('textarea', { style: Object.assign({}, S.input, { minHeight: '46px' }), value: owners, onChange: function (event) { setOwners(event.target.value) } }),
+            h('div', { style: Object.assign({}, S.fieldLabel, { marginTop: '10px' }) }, '谁可以给她发消息'),
+            h('textarea', { style: Object.assign({}, S.input, { minHeight: '46px' }), value: allow, placeholder: '一行一个。空着就是谁的消息都不收', onChange: function (event) { setAllow(event.target.value) } }),
+            h('div', { style: Object.assign({}, S.fieldLabel, { marginTop: '10px' }) }, '管理员'),
+            h('textarea', { style: Object.assign({}, S.input, { minHeight: '46px' }), value: admins, placeholder: '空着则上面的人都能用管理指令', onChange: function (event) { setAdmins(event.target.value) } }),
+            h('div', { style: Object.assign({}, S.row, { marginTop: '10px', justifyContent: 'space-between' }) },
+              h('span', null, '群里要 @ 或喊醒才回'),
+              h('button', { style: S.switch(wakeOn), onClick: function () { setWakeOn(!wakeOn) } }, wakeOn ? '开' : '关')),
+            h('input', { style: Object.assign({}, S.input, { marginTop: '6px' }), value: wakeWords, onChange: function (event) { setWakeWords(event.target.value) } }),
+            h('div', { style: Object.assign({}, S.row, { marginTop: '10px', justifyContent: 'space-between' }) },
+              h('span', null, '私聊默认回语音'),
+              h('button', { style: S.switch(voice), onClick: function () { setVoice(!voice) } }, voice ? '开' : '关')),
+            h('div', { style: Object.assign({}, S.row, { marginTop: '10px', justifyContent: 'space-between' }) },
+              h('span', null, '打开 DeepSeek 时自动登录'),
+              h('button', { style: S.switch(auto), onClick: function () { setAuto(!auto) } }, auto ? '开' : '关')),
+            h('div', { style: Object.assign({}, S.fieldLabel, { marginTop: '10px' }) }, '端口'),
+            h('input', { style: S.input, value: port, onChange: function (event) { setPort(event.target.value.replace(/\D/g, '').slice(0, 5)) } }),
+            h('div', { style: Object.assign({}, S.fieldLabel, { marginTop: '10px' }) }, '口令'),
+            h('input', { type: 'password', style: S.input, value: tokenInput, placeholder: body && body.tokenSet ? '已设置，留空则不改' : '没有口令。要设就填在这里', onChange: function (event) { setTokenInput(event.target.value) } }),
+            h('div', { style: Object.assign({}, S.fieldLabel, { marginTop: '10px' }) }, '单条回复最多多少字'),
+            h('input', { style: S.input, value: maxChars, onChange: function (event) { setMaxChars(event.target.value.replace(/\D/g, '').slice(0, 6)) } }),
+            h('div', { style: Object.assign({}, S.row, { marginTop: '10px' }) },
+              h('button', { style: S.btnPrimary, disabled: busy || !cfg, onClick: save }, busy ? '处理中…' : '保存')),
+            msg ? h('div', { style: Object.assign({}, msg.kind === 'err' ? S.err : S.ok, { marginTop: '8px' }) }, msg.text) : null),
+          h('div', { style: S.panel },
+            h('div', { style: S.title }, '调试'),
+            h('div', { style: Object.assign({}, S.row, { marginTop: '8px' }) },
+              h('button', { style: S.btnPrimary, disabled: busy, onClick: function () { finish(act('probe'), '已发给主人：测试。我在。') } }, '给主人发一句测试')),
+            heard ? h('div', { style: Object.assign({}, S.dim, { marginTop: '8px' }) }, '刚收到 ' + (heard.from || '') + '：' + heard.text) : h('div', { style: Object.assign({}, S.dim, { marginTop: '8px' }) }, '用手机给这个号发一句，这句话会出现在这里。'),
+            h('div', { style: Object.assign({}, S.fieldLabel, { marginTop: '10px' }) }, '她能听懂的指令'),
+            h('div', { style: S.dim }, '/help 能问什么　/new 新开一轮　/status 这轮用了多少'),
+            h('div', { style: S.dim }, '/model 换模型　/think 思考强度　/balance 账户余额'),
+            h('div', { style: Object.assign({}, S.dim, { marginTop: '4px' }) }, '在 QQ 里发给她就行。'),
+            h('div', { style: Object.assign({}, S.fieldLabel, { marginTop: '10px' }) }, '最近记录'),
+            h('div', {
+              style: Object.assign({}, S.mono, { whiteSpace: 'pre-wrap', maxHeight: '160px', overflow: 'auto', marginTop: '4px' }),
+            }, (body && body.log && body.log.length) ? body.log.join('\n') : '还没有记录。')))
+      }
+
+      function BridgePanel() {
+        return h(PanelBoundary, null, h(NapCatTab))
       }
 
       // ————————————————————————— 插件卡（settings.plugin.item） —————————————————————————
@@ -1217,13 +1516,13 @@
 
         return h('div', { style: S.panel },
           h('div', { style: Object.assign({}, S.row, { justifyContent: 'space-between', marginBottom: '6px' }) },
-            h('span', { style: { fontWeight: 700 } }, '消息桥（多平台综合桥）'),
+            h('span', { style: { fontWeight: 700 } }, '大肥鱼'),
             h(Pill, { on: !!(data && data.enabled), text: data && data.enabled ? 'ON' : 'OFF' })),
           h('div', { style: Object.assign({}, S.dim, { marginBottom: '6px' }) },
             channels.length ? (running + '/' + channels.length + ' 渠道运行 · ' + (summary ? summary.routes : 0) + ' 条路由') : '状态未知（API 未响应）'),
           h(EnabledToggleRow, { enabled: !!(data && data.enabled), onDone: refresh }),
           h('div', { style: Object.assign({}, S.dim, { marginTop: '6px' }) },
-            '运行状态 / 渠道配置 / 内置指令 / 聊天测试 见设置页下方「消息桥」区块。'))
+            'QQ 身体在设置页的「消息桥」里。'))
       }
 
       // ————————————————————————— apply：slot 注册入口 —————————————————————————

@@ -16,8 +16,9 @@
 import { dirname, join } from 'node:path'
 import { fileURLToPath } from 'node:url'
 import { createUserMessage } from './channels/host-packages.mjs'
-import { applyProfileEdit, ingestTurn, renderMemoryNote, retrieveMemory, splitMemoryUpdate } from './channels/qq-memory.mjs'
-import { splitOutbound } from './channels/qq-fish.mjs'
+import { applyProfileEdit, ingestTurn, markPinged, noteLastAsk, readDossier, renderMemoryNote, retrieveMemory, splitMemoryUpdate } from './channels/qq-memory.mjs'
+import { writeLogin } from './channels/napcat-body.mjs'
+import { checkInText, recentProject, shouldCheckIn, splitOutbound, workNote } from './channels/qq-fish.mjs'
 import { formatBalance, formatSessionStatus } from './channels/usage-report.mjs'
 
 /** 平台 Channel 基类（对标 AstrBot Platform）。 */
@@ -286,6 +287,7 @@ export class Bridge {
     }
     this.attachOutbound()
     this.watchDeletedSessions()
+    this.armCheckIn()
 
     // 会话自动清理：周期性 GC 超过 TTL 的空闲会话（仅当配置了 sessionTtlMinutes>0）
     const ttl = Number(this.config?.sessionTtlMinutes) || 0
@@ -370,6 +372,13 @@ export class Bridge {
     return this.config.memoryDir || join(dirname(fileURLToPath(import.meta.url)), 'data', 'memory')
   }
 
+  /** 连上 QQ 之后记下这个号，下次 NapCat 用它快速登录。 */
+  noteQqLogin(info) {
+    const uin = String(info?.uin || '').replace(/\D/g, '')
+    if (!uin) return
+    try { writeLogin(dirname(this.memoryDir()), { uin, nick: info?.nick || '' }) } catch {}
+  }
+
   /** 群里没叫她的话只记下来，不叫醒。 */
   overhear(sessionKey, text) {
     const line = String(text || '').trim()
@@ -386,11 +395,66 @@ export class Bridge {
     if (!sessionKey) return ''
     try {
       const dir = this.memoryDir()
-      if (spoken) ingestTurn(dir, sessionKey, { role: 'user', text: spoken })
+      if (spoken) {
+        ingestTurn(dir, sessionKey, { role: 'user', text: spoken })
+        noteLastAsk(dir, sessionKey, spoken)
+      }
       return renderMemoryNote(retrieveMemory(dir, sessionKey, spoken))
     } catch (error) {
       this.ctx.logger?.warn?.('[dsh-omnibridge] 记忆读取失败: %s', error instanceof Error ? error.message : String(error))
       return ''
+    }
+  }
+
+  /** 工作目录里最近在改的项目。一分钟内不重复翻磁盘。 */
+  workspaceGlance() {
+    const cwd = String(this.config.cwd || '').trim()
+    if (!cwd) return null
+    const now = Date.now()
+    if (this._glance && now - this._glance.at < 60000) return this._glance.value
+    const value = recentProject(cwd, now)
+    this._glance = { at: now, value }
+    return value
+  }
+
+  /** 主人隔了几小时没说话，白天私聊找一次，说项目停在哪、还搁着什么。 */
+  armCheckIn() {
+    const run = () => { void this.maybeCheckIn() }
+    const first = setTimeout(run, 20000)
+    const timer = setInterval(run, 10 * 60 * 1000)
+    first.unref?.()
+    timer.unref?.()
+    this.disposers.push(() => clearTimeout(first))
+    this.disposers.push(() => clearInterval(timer))
+  }
+
+  async maybeCheckIn() {
+    try {
+      const ch = this.channelOf('onebot')
+      if (!ch || ch.ws?.readyState !== 1) return
+      const owners = this.config.onebot?.ownerIds || []
+      if (!owners.length) return
+      const dir = this.memoryDir()
+      const glance = this.workspaceGlance()
+      const now = new Date()
+      for (const owner of owners) {
+        const key = `qq-private:${owner}`
+        const dossier = readDossier(dir, key)
+        if (!shouldCheckIn({ lastAt: dossier.lastAt, lastPing: dossier.lastPing, now })) continue
+        const text = checkInText({
+          project: glance?.project || dossier.now?.project,
+          step: dossier.now?.step,
+          lastAsk: dossier.lastAsk,
+          agenda: dossier.agenda,
+        })
+        if (!text) continue
+        const target = `private:${owner}`
+        if (this.config.onebot?.voiceReply !== false) ch.voiceTargets?.add(target)
+        await ch.send(target, text)
+        markPinged(dir, key, now)
+      }
+    } catch (error) {
+      this.ctx.logger?.warn?.('[dsh-omnibridge] 主动开口失败: %s', error instanceof Error ? error.message : String(error))
     }
   }
 
@@ -441,7 +505,7 @@ export class Bridge {
 
     const spoken = text
     const memoryNote = this.noteMemory(msg.sessionKey, spoken)
-    const notes = [msg.contextNote, memoryNote].filter(Boolean)
+    const notes = [msg.contextNote, workNote(this.workspaceGlance()), memoryNote].filter(Boolean)
     if (notes.length) {
       text = text ? `${notes.join('\n')}\n${text}` : notes.join('\n')
     }

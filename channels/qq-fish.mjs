@@ -3,7 +3,7 @@
  * 不连网、不碰 DSH，方便单独验证。
  */
 
-import { readFileSync } from 'node:fs'
+import { readdirSync, readFileSync, statSync } from 'node:fs'
 import { dirname, join } from 'node:path'
 import { fileURLToPath } from 'node:url'
 
@@ -45,10 +45,112 @@ export function identityNote(senderId, senderName, ownerIds) {
 }
 
 const VOICE_ASK = /语音回|用语音|发语音|语音回复|说给我听|念给我/
+const TEXT_ASK = /打字回|文字回|别发语音|不要语音|别用语音|用文字/
 
 /** 对方这句话是在让她用语音回。 */
 export function wantsVoiceReply(text) {
   return VOICE_ASK.test(String(text || ''))
+}
+
+/** 对方这句话是在让她改回打字。 */
+export function wantsTextReply(text) {
+  return TEXT_ASK.test(String(text || ''))
+}
+
+/** 私聊默认念出来。对方要文字时不念。群里仍要明说。 */
+export function prefersVoice(target, text, enabled = true) {
+  if (enabled === false) return false
+  if (wantsTextReply(text)) return false
+  const kind = String(target || '').split(':')[0]
+  if (kind === 'private') return true
+  return wantsVoiceReply(text)
+}
+
+const QUIET_MS = 3 * 60 * 60 * 1000
+
+/** 主人隔了几小时没说话，而且这段空档还没主动找过，白天就找一次。 */
+export function shouldCheckIn({ lastAt, lastPing, now = new Date(), quietMs = QUIET_MS } = {}) {
+  const seen = Date.parse(lastAt || '')
+  if (!Number.isFinite(seen)) return false
+  const clock = now instanceof Date ? now : new Date(now)
+  const hour = clock.getHours()
+  if (hour < 8 || hour >= 23) return false
+  if (clock.getTime() - seen < quietMs) return false
+  const ping = Date.parse(lastPing || '')
+  if (Number.isFinite(ping) && ping >= seen) return false
+  return true
+}
+
+/** 主动开口的那一句。没有近况就不找。 */
+export function checkInText({ project, step, lastAsk, agenda } = {}) {
+  const bits = []
+  if (project) bits.push(`你最近在改 ${project}`)
+  if (step) bits.push(`上次停在${step}`)
+  else if (lastAsk) bits.push(`上次你说「${String(lastAsk).slice(0, 40)}」`)
+  const pending = (agenda || []).map((item) => item?.text || item).filter(Boolean).slice(0, 3)
+  if (pending.length) bits.push(`还搁着：${pending.join('，')}`)
+  if (!bits.length) return ''
+  return `${bits.join('。')}。`
+}
+
+/** 只给她看：主人说「这个」「继续」时指的就是最近在改的项目。 */
+export function workNote(glance) {
+  if (!glance?.project) return ''
+  const file = glance.file ? `，刚动过 ${glance.file}` : ''
+  return `[正在做] 当前项目是 ${glance.project}${file}。主人说「这个」或「继续」时就是它，不用再问路径。这行不要复述。`
+}
+
+const PROJECT_SKIP = new Set(['node_modules', '.git', 'dist', 'build', 'data', 'coverage', '.dsh'])
+
+/** 工作目录里最近改过文件的那个项目。 */
+export function recentProject(root, now = Date.now(), withinMs = 36 * 60 * 60 * 1000) {
+  const base = String(root || '').trim()
+  if (!base) return null
+  let entries
+  try { entries = readdirSync(base, { withFileTypes: true }) } catch { return null }
+  const budget = { left: 800 }
+  let best = null
+  for (const entry of entries) {
+    if (budget.left <= 0) break
+    if (entry.name.startsWith('.') || PROJECT_SKIP.has(entry.name)) continue
+    const path = join(base, entry.name)
+    const found = entry.isDirectory()
+      ? newestFile(path, entry.name, 2, budget)
+      : stampFile(path, entry.name, budget)
+    if (!found || now - found.mtime > withinMs) continue
+    if (!best || found.mtime > best.mtime) {
+      best = { project: entry.isDirectory() ? entry.name : entry.name, file: found.rel, mtime: found.mtime }
+    }
+  }
+  if (!best) return null
+  return { project: best.project, file: best.file, at: new Date(best.mtime).toISOString() }
+}
+
+function newestFile(dir, rel, depth, budget) {
+  if (depth < 0 || budget.left <= 0) return null
+  let entries
+  try { entries = readdirSync(dir, { withFileTypes: true }) } catch { return null }
+  let best = null
+  for (const entry of entries) {
+    if (budget.left <= 0) break
+    if (entry.name.startsWith('.') || PROJECT_SKIP.has(entry.name)) continue
+    const path = join(dir, entry.name)
+    const next = `${rel}/${entry.name}`
+    const found = entry.isDirectory() ? newestFile(path, next, depth - 1, budget) : stampFile(path, next, budget)
+    if (found && (!best || found.mtime > best.mtime)) best = found
+  }
+  return best
+}
+
+function stampFile(path, rel, budget) {
+  budget.left -= 1
+  try {
+    const st = statSync(path)
+    if (!st.isFile()) return null
+    return { mtime: st.mtimeMs, rel }
+  } catch {
+    return null
+  }
 }
 
 /** 系统提示不要念成语音条。 */

@@ -1,4 +1,7 @@
 import assert from 'node:assert/strict'
+import { mkdirSync, mkdtempSync, utimesSync, writeFileSync } from 'node:fs'
+import { tmpdir } from 'node:os'
+import { join } from 'node:path'
 import test from 'node:test'
 import {
   formatAlbumList,
@@ -8,14 +11,20 @@ import {
   identityNote,
   isSendableImage,
   chatBubbles,
+  checkInText,
   isSystemOutbound,
   loadFaceMap,
   parseOnebotMessage,
+  prefersVoice,
+  recentProject,
   shouldAnswerGroup,
+  shouldCheckIn,
   splitOutbound,
   spokenForTts,
   toOnebotSegments,
+  wantsTextReply,
   wantsVoiceReply,
+  workNote,
 } from './qq-fish.mjs'
 
 const { nameToId, idToName } = loadFaceMap()
@@ -61,12 +70,46 @@ test('主人号和别人的身份标记不一样', () => {
   assert.match(identityNote('10000', '路人', ['2711686331']), /不要复述/)
 })
 
-test('只有明说用语音回才念出来，系统提示不念', () => {
+test('私聊默认念出来，对方要打字或在群里就改回文字', () => {
   assert.equal(wantsVoiceReply('用语音回我'), true)
   assert.equal(wantsVoiceReply('在吗'), false)
+  assert.equal(wantsTextReply('打字回我'), true)
+  assert.equal(prefersVoice('private:1', '在吗'), true)
+  assert.equal(prefersVoice('private:1', '打字回我'), false)
+  assert.equal(prefersVoice('group:1', '在吗'), false)
+  assert.equal(prefersVoice('group:1', '用语音回我'), true)
   assert.equal(isSystemOutbound('⏳ 收到，开始处理…'), true)
   assert.equal(isSystemOutbound('在的[旺柴]'), false)
   assert.equal(spokenForTts('在的[旺柴]呀'), '在的呀')
+})
+
+test('隔了几小时、白天、这段空档还没找过，才主动开口', () => {
+  const now = new Date('2026-10-28T18:00:00')
+  const ago = new Date(now.getTime() - 4 * 60 * 60 * 1000).toISOString()
+  assert.equal(shouldCheckIn({ lastAt: ago, now }), true)
+  assert.equal(shouldCheckIn({ lastAt: ago, lastPing: now.toISOString(), now }), false)
+  assert.equal(shouldCheckIn({ lastAt: now.toISOString(), now }), false)
+  assert.equal(shouldCheckIn({ lastAt: ago, now: new Date('2026-10-28T23:30:00') }), false)
+  assert.equal(checkInText({}), '')
+  assert.match(checkInText({ project: '大肥鱼', step: '语音还没听', agenda: [{ text: '今晚把安排理一下' }] }), /大肥鱼/)
+  assert.match(workNote({ project: '大肥鱼', file: '大肥鱼/a.js' }), /当前项目是 大肥鱼/)
+})
+
+test('工作目录里最近改过的项目能被认出来', () => {
+  const root = mkdtempSync(join(tmpdir(), 'qq-work-'))
+  mkdirSync(join(root, '老项目'), { recursive: true })
+  mkdirSync(join(root, '大肥鱼'), { recursive: true })
+  const oldFile = join(root, '老项目', 'a.txt')
+  const newFile = join(root, '大肥鱼', 'b.txt')
+  writeFileSync(oldFile, 'old')
+  writeFileSync(newFile, 'new')
+  const old = new Date('2026-10-27T08:00:00')
+  const fresh = new Date('2026-10-28T18:00:00')
+  utimesSync(oldFile, old, old)
+  utimesSync(newFile, fresh, fresh)
+  const glance = recentProject(root, fresh.getTime())
+  assert.equal(glance.project, '大肥鱼')
+  assert.match(glance.file, /b\.txt/)
 })
 
 test('发图和说说的标记不会留在聊天文字里', () => {

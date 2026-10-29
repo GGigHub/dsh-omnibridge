@@ -1,44 +1,8 @@
 /**
- * dsh-omnibridge —— 综合消息桥（架构参考 AstrBot 多平台接入）。
+ * dsh-omnibridge —— 大肥鱼的 QQ 身体。
  *
- * 一个插件把 DeepSeek Harness 接入多个聊天平台：
- *   - onebot    QQ（OneBot v11 WS 客户端，适配 NapCat / go-cqhttp / Lagrange）
- *   - telegram  Telegram（Bot API long polling）
- *   - webhook   通用 Webhook（飞书 / 企业微信 / 钉钉 / 自定义 JSON），
- *               入站走 DSH webServer，出站 POST 到机器人 webhook
- *   - satori    Satori 网关
- *   - webchat   内置 WebChat（HTTP，供浏览器测试）
- *   - weixin_oc 个人微信（iLink 官方接口，自带二维码登录）
- *
- * 配置（DSH_HOME/settings.yaml）：
- *   dsh-omnibridge:
- *     enabled: true
- *     allowFrom: []            # 必填安全意识：空=拒绝所有入站；'*'=放行所有
- *     agentPreset: standard    # 新会话预设：standard / minimal / ptc / cordis
- *     agentProvider: ~
- *     agentModel: ~
- *     cwd: ~
- *     maxMessageChars: 2000
- *     onebot:
- *       enabled: true
- *       url: ws://127.0.0.1:3001?access_token=%20
- *     telegram:
- *       enabled: false
- *       token: ''
- *     webhooks:
- *       - id: feishu
- *         enabled: false
- *         format: auto          # auto|feishu|wecom|dingtalk|custom
- *         path: /dsh-omnibridge/webhook/feishu
- *         outboundUrl: ''
- *     weixin_oc:
- *       enabled: false
- *       baseUrl: ''            # 留空用默认 https://ilinkai.weixin.qq.com
- *       token: ''               # 留空启动时会扫码登录；登录后自动写回 state 文件
- *
- * 状态/设置 API：
- *   GET  /dsh-omnibridge/status
- *   GET/POST /dsh-omnibridge/settings
+ * DeepSeek 是贾维斯，NapCat 是身体，QQ 是对话。目标见 JARVIS.md。
+ * 别的平台配置还留在文件里，桥接不再启动它们。
  *
  * @module dsh-omnibridge
  */
@@ -50,12 +14,9 @@ import { z } from './channels/host-packages.mjs'
 import { Bridge } from './bridge-core.mjs'
 import { beginScan, pollScan, wecomKfScan } from './channels/scan-registration.mjs'
 import { OneBotChannel } from './channels/onebot.mjs'
-import { TelegramChannel } from './channels/telegram.mjs'
-import { WebhookChannel } from './channels/webhook.mjs'
-import { SatoriChannel } from './channels/satori.mjs'
-import { WebchatChannel } from './channels/webchat.mjs'
-import { WeixinOCChannel } from './channels/weixin_oc.mjs'
 import { readJsonBody, respondJson } from './channels/http-utils.mjs'
+import { alignDshServer, appendBodyLog, armQqBody, ensureQqBody, findNapcatDir, logoutQq, napcatWebCredential, onebotPort, openNapcatWeb, pickNapcatFolder, qqBodyStatus, qrcodePath, readAccounts, readBodyLog, showQqWindow, splitOnebotUrl, switchQqAccount, writeLogin } from './channels/napcat-body.mjs'
+import { createReadStream, existsSync as fileExists } from 'node:fs'
 
 const NAMESPACE = 'dsh-omnibridge'
 const CONFIG_FILE = join(fileURLToPath(new URL('.', import.meta.url)), 'config.json')
@@ -108,9 +69,14 @@ export const Config = z.object({
     groupWakeWords: z.array(z.string()).default(['大肥鱼']),
     // 这些 QQ 在她的上下文里标成主人，对方看不到
     ownerIds: z.array(z.string()).default(['2711686331']),
-    // 对方明说用语音回时，用本机语音合成一条语音
+    // 私聊默认回一条语音，对方说打字就改回文字。群里仍要明说才念。
     voiceReply: z.boolean().default(true),
     ttsScript: z.string().default(''),
+    // 填了安装目录并打开后，DeepSeek 启动时才拉起 NapCat。
+    autoStart: z.boolean().default(false),
+    napcatDir: z.string().default(''),
+    // 留空则用上次登录记住的号。扫码换号时这一次不带号。
+    loginUin: z.string().default(''),
   }).default({}),
   telegram: z.object({
     enabled: z.boolean().default(false),
@@ -165,36 +131,12 @@ function writeFileEnabled(enabled) {
   writeFileSync(CONFIG_FILE, JSON.stringify({ enabled }, null, 2), 'utf8')
 }
 
-/** 实例化 channel 列表。 */
+/** 只接 QQ。别的平台配置还留在文件里，不再启动。 */
 function buildChannels(config) {
-  const channels = []
-  channels.push(new OneBotChannel({
+  return [new OneBotChannel({
     ...(config.onebot || {}),
-    name: 'QQ (OneBot v11)',
-  }))
-  channels.push(new TelegramChannel({
-    ...(config.telegram || {}),
-    name: 'Telegram',
-  }))
-  for (const wh of config.webhooks || []) {
-    channels.push(new WebhookChannel(wh.id || 'webhook', {
-      ...wh,
-      name: `Webhook ${wh.id || ''}`.trim(),
-    }))
-  }
-  channels.push(new SatoriChannel({
-    ...(config.satori || {}),
-    name: 'Satori (Discord/KOOK/Slack/Mattermost/Misskey...)',
-  }))
-  channels.push(new WebchatChannel('webchat', {
-    ...(config.webchat || {}),
-    name: 'WebChat (HTTP)',
-  }))
-  channels.push(new WeixinOCChannel({
-    ...(config.weixin_oc || {}),
-    name: '个人微信 (iLink)',
-  }))
-  return channels
+    name: 'QQ',
+  })]
 }
 
 export function apply(ctx, config) {
@@ -222,6 +164,9 @@ export function apply(ctx, config) {
       bridge = new Bridge(ctx, cfg, buildChannels(cfg))
       try {
         await bridge.start()
+        if (cfg.onebot?.enabled !== false && cfg.onebot?.autoStart === true && cfg.onebot?.napcatDir) {
+          armQqBody(bodyOptions(cfg))
+        }
       } catch (error) {
         ctx.logger?.error?.('[dsh-omnibridge] bridge start failed: %s', error instanceof Error ? error.stack : String(error))
       }
@@ -282,6 +227,7 @@ export function apply(ctx, config) {
               if (Object.keys(rest).length) {
                 try {
                   await scope.update(rest)
+                  rememberQqChoice(scope.get())
                 } catch (error) {
                   respondJson(response, 400, { error: '配置校验失败：' + (error instanceof Error ? error.message : String(error)) })
                   return
@@ -299,6 +245,103 @@ export function apply(ctx, config) {
         }
       }
     }), 'dsh-omnibridge: settings route')
+
+    ctx.effect(() => ctx.webServer.register({
+      kind: 'exact',
+      path: `${API_PREFIX}/qq-body`,
+      handler: async (request, response) => {
+        try {
+          const cfg = scope.get()
+          if (request.method === 'GET' || request.method === 'HEAD') {
+            respondJson(response, 200, await qqView(cfg, bridge))
+            return
+          }
+          if (request.method === 'POST') {
+            const body = await readJsonBody(request)
+            const action = String(body.action || 'start')
+            const dataDir = qqDataDir()
+            if (action === 'logout') {
+              await logoutQq()
+              appendBodyLog(dataDir, '退出登录')
+              respondJson(response, 200, await qqView(cfg, bridge))
+              return
+            }
+            if (action === 'show') {
+              respondJson(response, 200, await showQqWindow())
+              return
+            }
+            if (action === 'web') {
+              const status = await qqBodyStatus(bodyOptions(cfg))
+              await openNapcatWeb(status.napcatDir || cfg.onebot?.napcatDir || '')
+              appendBodyLog(dataDir, '打开网页')
+              respondJson(response, 200, { ok: true })
+              return
+            }
+            if (action === 'reconnect') {
+              onebotChannel(bridge)?.reconnectNow?.()
+              appendBodyLog(dataDir, '重新连接 DeepSeek')
+              respondJson(response, 200, await qqView(cfg, bridge))
+              return
+            }
+            if (action === 'probe') {
+              const owner = (cfg.onebot?.ownerIds || []).map((item) => String(item || '').trim()).find((item) => /^\d{5,12}$/.test(item)) || ''
+              const channel = onebotChannel(bridge)
+              if (!channel) throw new Error('QQ 还没接上')
+              await channel.sendProbe(owner)
+              appendBodyLog(dataDir, '给主人发了一句测试')
+              respondJson(response, 200, { ok: true })
+              return
+            }
+            const configured = String(body.napcatDir || cfg.onebot?.napcatDir || '')
+            const options = bodyOptions(cfg, {
+              configured,
+              uin: body.fresh ? '' : String(body.loginUin || cfg.onebot?.loginUin || ''),
+              fresh: !!body.fresh,
+            })
+            appendBodyLog(dataDir, body.fresh ? '扫码登录' : '用记住的号登录')
+            if (action === 'switch') await switchQqAccount(options)
+            else await ensureQqBody(options)
+            respondJson(response, 200, await qqView(cfg, bridge))
+            return
+          }
+          response.writeHead(405)
+          response.end()
+        } catch (error) {
+          respondJson(response, 400, { error: error instanceof Error ? error.message : String(error) })
+        }
+      }
+    }), 'dsh-omnibridge: qq body')
+
+    ctx.effect(() => ctx.webServer.register({
+      kind: 'exact',
+      path: `${API_PREFIX}/qq-body/qrcode`,
+      handler: async (request, response) => {
+        try {
+          if (request.method !== 'GET' && request.method !== 'HEAD') { response.writeHead(405); response.end(); return }
+          const status = await qqBodyStatus(bodyOptions(scope.get()))
+          const file = qrcodePath(status.napcatDir)
+          if (!file || !fileExists(file)) { response.writeHead(404); response.end(); return }
+          response.writeHead(200, { 'Content-Type': 'image/png', 'Cache-Control': 'no-store' })
+          if (request.method === 'HEAD') { response.end(); return }
+          createReadStream(file).pipe(response)
+        } catch (error) {
+          respondJson(response, 400, { error: error instanceof Error ? error.message : String(error) })
+        }
+      }
+    }), 'dsh-omnibridge: qq qrcode')
+
+    ctx.effect(() => ctx.webServer.register({
+      kind: 'exact',
+      path: `${API_PREFIX}/qq-body/pick`,
+      handler: async (request, response) => {
+        try {
+          if (request.method !== 'POST') { response.writeHead(405); response.end(); return }
+          respondJson(response, 200, await pickNapcatFolder())
+        } catch (error) {
+          respondJson(response, 400, { error: error instanceof Error ? error.message : String(error) })
+        }
+      }
+    }), 'dsh-omnibridge: qq pick')
 
     // —— 平台扫码接入（飞书/钉钉/QQ 官方，协议见 channels/scan-registration.mjs） ——
     ctx.effect(() => ctx.webServer.register({
@@ -348,6 +391,59 @@ export function apply(ctx, config) {
         }
       }
     }), 'dsh-omnibridge: scan wecom-kf')
+}
+
+function qqDataDir() {
+  return join(dirname(CONFIG_FILE), 'data')
+}
+
+function bodyOptions(cfg, extra = {}) {
+  const onebot = cfg?.onebot || {}
+  return {
+    dataDir: qqDataDir(),
+    configured: onebot.napcatDir || '',
+    uin: onebot.loginUin || '',
+    port: onebotPort(onebot.url),
+    ...extra,
+  }
+}
+
+function rememberQqChoice(cfg) {
+  const onebot = cfg?.onebot
+  if (!onebot || typeof onebot !== 'object') return
+  const patch = {}
+  const resolved = findNapcatDir({ configured: onebot.napcatDir || '' })
+  if (resolved) patch.napcatDir = resolved
+  if (/^\d{5,12}$/.test(String(onebot.loginUin || ''))) patch.uin = String(onebot.loginUin)
+  if (Object.keys(patch).length) {
+    try { writeLogin(qqDataDir(), patch) } catch { /* 目录还没建好时，下次登录仍会记 */ }
+  }
+  if (!resolved) return
+  const link = splitOnebotUrl(onebot.url)
+  try {
+    alignDshServer(resolved, { port: link.port, token: link.token, uin: patch.uin || '' })
+  } catch { /* 这个号还没有连接文件时，登录之后再对齐 */ }
+}
+
+function onebotChannel(bridge) {
+  return bridge?.channels?.find((item) => item.id === 'onebot') || null
+}
+
+async function qqView(cfg, bridge) {
+  const status = await qqBodyStatus(bodyOptions(cfg))
+  const link = splitOnebotUrl(cfg?.onebot?.url)
+  const channel = onebotChannel(bridge)
+  const web = napcatWebCredential(status.napcatDir || status.runningDir || '')
+  return {
+    ...status,
+    link: channel?.linkState?.() || { connected: false, reconnecting: false, selfId: '', lastHeard: null },
+    accounts: readAccounts(qqDataDir()),
+    log: readBodyLog(qqDataDir()),
+    webPort: web.port,
+    webToken: web.token,
+    port: link.port,
+    tokenSet: !!link.token,
+  }
 }
 
 export { NAMESPACE, API_PREFIX }

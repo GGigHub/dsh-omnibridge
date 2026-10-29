@@ -27,11 +27,15 @@ export function splitMemoryUpdate(text) {
     return ''
   }).replace(/\n{3,}/g, '\n\n').trim()
   if (!edits.length) return { visible, edit: null }
+  const now = edits.map((item) => item.now).filter(Boolean).at(-1) || null
   return {
     visible,
     edit: {
       add: edits.flatMap((item) => item.add),
       forget: edits.flatMap((item) => item.forget),
+      agenda: edits.flatMap((item) => item.agenda),
+      done: edits.flatMap((item) => item.done),
+      now,
     },
   }
 }
@@ -60,7 +64,7 @@ export function ingestTurn(dir, sessionKey, { role, text, at = new Date() }) {
   return fragment
 }
 
-/** 模型点名要记住或忘掉的，直接改档案。 */
+/** 模型点名要记住、忘掉、改近况或记日程时，直接改档案。 */
 export function applyProfileEdit(dir, sessionKey, edit) {
   const store = ensure(dir, sessionKey)
   const state = readState(store)
@@ -80,6 +84,59 @@ export function applyProfileEdit(dir, sessionKey, edit) {
     else facts.push({ text, hits: PROMOTE_AT, at: new Date().toISOString() })
   }
   state.profile.facts = facts.slice(-80)
+  if (edit?.now) {
+    const project = clip(edit.now.project, 80)
+    const step = clip(edit.now.step, 160)
+    if (project) state.profile.now.project = project
+    if (step) state.profile.now.step = step
+    if (project || step) state.profile.now.at = new Date().toISOString()
+  }
+  for (const item of edit?.agenda || []) {
+    const text = clip(item, 160)
+    if (!text || state.profile.agenda.some((row) => row.text === text)) continue
+    state.profile.agenda.push({ text, at: new Date().toISOString() })
+  }
+  state.profile.agenda = state.profile.agenda.slice(-20)
+  for (const gone of edit?.done || []) {
+    const needle = String(gone || '').trim()
+    if (!needle) continue
+    state.profile.agenda = state.profile.agenda.filter((row) => row.text !== needle && !row.text.includes(needle))
+  }
+  writeState(store, state)
+  return state.profile
+}
+
+/** 主人刚说的这句，下次不用他再讲一遍。 */
+export function noteLastAsk(dir, sessionKey, text, at = new Date()) {
+  const body = clip(text, 200)
+  if (!body || !sessionKey) return null
+  const store = ensure(dir, sessionKey)
+  const state = readState(store)
+  state.profile.lastAsk = body
+  state.profile.lastAt = (at instanceof Date ? at : new Date(at)).toISOString()
+  writeState(store, state)
+  return state.profile
+}
+
+export function readDossier(dir, sessionKey) {
+  const store = ensure(dir, sessionKey)
+  const state = readState(store)
+  if (!state.profile.lastAt) {
+    const rows = readTailLines(store.fragments, 8192).filter((row) => row.role === 'user')
+    const last = rows[rows.length - 1]
+    if (last?.at) {
+      state.profile.lastAt = last.at
+      if (!state.profile.lastAsk) state.profile.lastAsk = String(last.text || '').slice(0, 200)
+    }
+  }
+  return state.profile
+}
+
+/** 这段空档已经主动找过，主人再说话之前不再找。 */
+export function markPinged(dir, sessionKey, at = new Date()) {
+  const store = ensure(dir, sessionKey)
+  const state = readState(store)
+  state.profile.lastPing = (at instanceof Date ? at : new Date(at)).toISOString()
   writeState(store, state)
   return state.profile
 }
@@ -114,11 +171,21 @@ export function retrieveMemory(dir, sessionKey, query) {
     episodes,
     fragments: ranked.slice(0, 10),
     rawBytes: fileSize(store.raw),
+    now: state.profile.now,
+    agenda: state.profile.agenda,
+    lastAsk: state.profile.lastAsk,
   }
 }
 
 export function renderMemoryNote(packet) {
   const lines = ['[记忆] 档案、篇章、碎片、原文分四层存在本地，删掉会话也不会清。这次只带相关的几层。不要原样发到 QQ。']
+  const doing = [packet?.now?.project, packet?.now?.step].filter(Boolean).join('，')
+  if (doing) lines.push(`正在做：${doing}`)
+  if (packet?.lastAsk) lines.push(`上次主人说：${packet.lastAsk}`)
+  if (packet?.agenda?.length) {
+    lines.push('安排：')
+    for (const item of packet.agenda) lines.push(`- ${item.text}`)
+  }
   if (packet?.facts?.length) {
     lines.push('档案：')
     for (const fact of packet.facts) lines.push(`- ${fact.text}`)
@@ -131,7 +198,7 @@ export function renderMemoryNote(packet) {
     lines.push('碎片：')
     for (const fragment of packet.fragments) lines.push(`- ${fragment.text}`)
   }
-  lines.push('若有该长期记住的称呼、约定、偏好或近况，在回复最末另起一行写 <memory>{"add":["一句"],"forget":["旧事实原文"]}</memory>。没有就别写。这一行不会发给对方。')
+  lines.push('主人的习惯、正在做的项目、做到哪一步、今晚要办的事，在回复最末另起一行写 <memory>{"now":{"project":"项目","step":"停在哪"},"agenda":["今晚要办的"],"done":["办完的原文"],"add":["一句长期的事"],"forget":["旧事实原文"]}</memory>。没有就别写。这一行不会发给对方。')
   return fit(lines.join('\n'), BUDGET)
 }
 
@@ -207,10 +274,10 @@ function readState(store) {
     return {
       next: Number(parsed.next) || 1,
       pending: Array.isArray(parsed.pending) ? parsed.pending : [],
-      profile: { facts: Array.isArray(parsed.profile?.facts) ? parsed.profile.facts : [] },
+      profile: normalizeProfile(parsed.profile),
     }
   } catch {
-    return { next: 1, pending: [], profile: { facts: [] } }
+    return { next: 1, pending: [], profile: normalizeProfile(null) }
   }
 }
 
@@ -270,13 +337,35 @@ function terms(text) {
   return found
 }
 
+function normalizeProfile(profile) {
+  const now = profile?.now && typeof profile.now === 'object' ? profile.now : {}
+  return {
+    facts: Array.isArray(profile?.facts) ? profile.facts : [],
+    now: {
+      project: String(now.project || ''),
+      step: String(now.step || ''),
+      at: String(now.at || ''),
+    },
+    agenda: Array.isArray(profile?.agenda) ? profile.agenda : [],
+    lastAsk: String(profile?.lastAsk || ''),
+    lastAt: String(profile?.lastAt || ''),
+    lastPing: String(profile?.lastPing || ''),
+  }
+}
+
 function parseMemoryEdit(body) {
   try {
     const parsed = JSON.parse(String(body || '').trim())
     const add = Array.isArray(parsed.add) ? parsed.add.map((item) => String(item)) : []
     const forget = Array.isArray(parsed.forget) ? parsed.forget.map((item) => String(item)) : []
-    if (!add.length && !forget.length) return null
-    return { add, forget }
+    const agenda = Array.isArray(parsed.agenda) ? parsed.agenda.map((item) => String(item)) : []
+    const done = Array.isArray(parsed.done) ? parsed.done.map((item) => String(item)) : []
+    const now = parsed.now && typeof parsed.now === 'object'
+      ? { project: String(parsed.now.project || ''), step: String(parsed.now.step || '') }
+      : null
+    const hasNow = !!(now && (now.project || now.step))
+    if (!add.length && !forget.length && !agenda.length && !done.length && !hasNow) return null
+    return { add, forget, agenda, done, now: hasNow ? now : null }
   } catch {
     return null
   }

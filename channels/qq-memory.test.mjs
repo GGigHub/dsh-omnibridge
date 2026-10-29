@@ -7,6 +7,8 @@ import {
   applyProfileEdit,
   ingestTurn,
   memoryFileName,
+  noteLastAsk,
+  readDossier,
   retrieveMemory,
   renderMemoryNote,
   splitMemoryUpdate,
@@ -62,4 +64,24 @@ test('坏掉的记事标签不会发给对方', () => {
   const { visible, edit } = splitMemoryUpdate('在的<memory>不是json</memory>')
   assert.equal(visible, '在的')
   assert.equal(edit, null)
+})
+
+test('近况、安排和上次那句会留在档案里', () => {
+  const dir = mkdtempSync(join(tmpdir(), 'qq-memory-'))
+  const key = 'qq-private:2711686331'
+  const { visible, edit } = splitMemoryUpdate('记下了。\n<memory>{"now":{"project":"大肥鱼","step":"语音还没听"},"agenda":["今晚把安排理一下"],"add":[]}</memory>')
+  assert.equal(visible, '记下了。')
+  const profile = applyProfileEdit(dir, key, edit)
+  assert.equal(profile.now.project, '大肥鱼')
+  assert.equal(profile.agenda[0].text, '今晚把安排理一下')
+  noteLastAsk(dir, key, '把这个功能做上', new Date('2026-10-28T10:00:00'))
+  const packet = retrieveMemory(dir, key, '无关')
+  const note = renderMemoryNote(packet)
+  assert.match(note, /正在做：大肥鱼，语音还没听/)
+  assert.match(note, /上次主人说：把这个功能做上/)
+  assert.match(note, /今晚把安排理一下/)
+  const done = applyProfileEdit(dir, key, { add: [], forget: [], agenda: [], done: ['今晚把安排理一下'], now: null })
+  assert.equal(done.agenda.length, 0)
+  const dossier = readDossier(dir, key)
+  assert.equal(dossier.lastAsk, '把这个功能做上')
 })

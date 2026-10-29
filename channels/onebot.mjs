@@ -30,9 +30,9 @@ import {
   parseOnebotMessage,
   shouldAnswerGroup,
   splitOutbound,
+  prefersVoice,
   spokenForTts,
   toOnebotSegments,
-  wantsVoiceReply,
 } from './qq-fish.mjs'
 
 /** OneBot action 回执等待上限。 */
@@ -113,7 +113,10 @@ export class OneBotChannel extends Channel {
       this.ctx?.logger?.info?.('[dsh-omnibridge:onebot] connected to %s', this.url)
       this.reconnector.reset()
       this.call('get_login_info', {}, LOGIN_TIMEOUT_MS).then((r) => {
-        if (r?.retcode === 0 && r?.data?.user_id) this.selfId = String(r.data.user_id)
+        if (r?.retcode === 0 && r?.data?.user_id) {
+          this.selfId = String(r.data.user_id)
+          this.bridge?.noteQqLogin?.({ uin: this.selfId, nick: r.data.nickname || '' })
+        }
       }).catch(() => {})
     }
     this.ws.onmessage = (ev) => {
@@ -122,6 +125,12 @@ export class OneBotChannel extends Channel {
       void this.handleMessage(data)
     }
     this.ws.onclose = () => {
+      if (this.closed) return
+      if (this.manualReconnect) {
+        this.manualReconnect = false
+        this.connect()
+        return
+      }
       this.ctx?.logger?.warn?.('[dsh-omnibridge:onebot] connection closed, reconnecting…')
       this.scheduleReconnect()
     }
@@ -179,7 +188,9 @@ export class OneBotChannel extends Channel {
     if (!text && !parsed.images.length) return
 
     const target = isGroup ? `group:${data.group_id}` : `private:${senderId}`
-    if (this.config.voiceReply !== false && wantsVoiceReply(text)) this.voiceTargets.add(target)
+    const command = text.startsWith('/')
+    if (!command && prefersVoice(target, text, this.config.voiceReply !== false)) this.voiceTargets.add(target)
+    else this.voiceTargets.delete(target)
     const sessionKey = isGroup ? `qq-group:${data.group_id}` : `qq-private:${senderId}`
     const senderName = data.sender?.card || data.sender?.nickname || senderId
     await this.acceptChat(new InboundMessage({
@@ -191,9 +202,9 @@ export class OneBotChannel extends Channel {
       images: parsed.images.length ? parsed.images : undefined,
       contextNote: [
         identityNote(senderId, senderName, this.config.ownerIds || ['2711686331']),
-        '[怎么说话] 像在 QQ 里聊天。用空行分成两三条，每条只说一两句，不要写成一段作文，也不必每句都追问。有时回一个表情就够。对方连着发来的几句是同一次。查天气、新闻、网页这些实时信息，用你已有的搜索工具去查，不要说自己不能联网。',
-        '[改代码] 主人让你改代码、加功能、修问题时，在当前工作目录里看文件、改文件、跑命令。不要说自己不能写文件。改完用一两句说改了哪个文件、怎么看结果。不要把整份代码贴到 QQ。对方指定了别的路径，就去那个路径。',
-        '[能做的事] 对方没让你做就别做。标记不要原样发出来。发图 <image>网址或本机路径</image>。发说说 <qzone>正文</qzone>。撤回 <recall>消息号</recall>。戳一戳 <poke>QQ号</poke>，私聊可写 <poke/>。点赞 <like>QQ号</like>，多次写 <like times="3">QQ号</like>，最多 10。改备注 <remark user="QQ号">备注</remark>，私聊可写 <remark>备注</remark>。群公告 <notice>正文</notice>。传文件 <file>本机路径或网址</file>。看最近聊天 <history>20</history>。看群文件 <files/>，要下载地址就写 <files>文件名</files>。看群相册 <album/>，看某个相册 <album>相册名</album>。群里没点你的话已经记在这个群的记事里，不要主动插话。',
+        '[怎么说话] 像在 QQ 里聊天。用空行分成两三条，每条只说一两句，不要写成一段作文，也不必每句都追问。有时回一个表情就够。对方连着发来的几句是同一次。查天气、新闻、网页这些实时信息，用你已有的搜索工具去查，不要说自己不能联网。私聊你的回复会另外念成语音，所以文字保持短。',
+        '[先做] 主人交代的事直接做完，再用一两句说结果。少反问。改代码就改「正在做」的那个项目，看文件、改文件、跑命令，不要说自己不能写文件。对方指定了别的路径就去那个路径。日程写进记事的 agenda，办完的写进 done。不要把整份代码贴到 QQ。',
+        '[能做的事] 标记不要原样发出来。发图 <image>网址或本机路径</image>。发说说 <qzone>正文</qzone>。撤回 <recall>消息号</recall>。戳一戳 <poke>QQ号</poke>，私聊可写 <poke/>。点赞 <like>QQ号</like>，多次写 <like times="3">QQ号</like>，最多 10。改备注 <remark user="QQ号">备注</remark>，私聊可写 <remark>备注</remark>。群公告 <notice>正文</notice>。传文件 <file>本机路径或网址</file>。看最近聊天 <history>20</history>。看群文件 <files/>，要下载地址就写 <files>文件名</files>。看群相册 <album/>，看某个相册 <album>相册名</album>。群里没点你的话已经记在这个群的记事里，不要主动插话。',
       ].join('\n'),
       raw: { target, messageId: data.message_id },
     }))
@@ -201,7 +212,9 @@ export class OneBotChannel extends Channel {
 
   /** 连发的几句合成一次。以 / 开头的命令不等。 */
   async acceptChat(msg) {
-    const text = String(msg.text || '').trim()
+    const heard = String(msg.text || '').trim()
+    if (heard) this.lastHeard = { from: msg.senderName || msg.senderId || '', text: heard.slice(0, 80), at: Date.now() }
+    const text = heard
     if (text.startsWith('/')) {
       await this.flushInbox(msg.sessionKey)
       await this.bridge?.handleInbound(msg)
@@ -318,7 +331,8 @@ export class OneBotChannel extends Channel {
     if (!body && !chatImages.length && posted) body = '发到空间了。'
     const hold = lookups.length > 0
     if (!body && !chatImages.length && acks.length && !hold) body = acks.join('\n')
-    if (!hold && this.voiceTargets.has(target) && body && !isSystemOutbound(body)) {
+    const report = /累计 token|账户余额|当前会话：|未知命令|命令执行/.test(body || '')
+    if (!hold && this.voiceTargets.has(target) && body && !isSystemOutbound(body) && !report) {
       this.voiceTargets.delete(target)
       const spoken = spokenForTts(body)
       if (spoken) {
@@ -479,6 +493,38 @@ export class OneBotChannel extends Channel {
     try { this.ws?.close() } catch {}
     for (const p of this.pending.values()) { clearTimeout(p.timer); p.reject(new Error('channel stopped')) }
     this.pending.clear()
+  }
+
+  linkState() {
+    const connected = this.ws?.readyState === 1
+    return {
+      connected: !!connected,
+      reconnecting: !this.closed && !connected,
+      selfId: this.selfId || '',
+      lastHeard: this.lastHeard || null,
+    }
+  }
+
+  reconnectNow() {
+    this.closed = false
+    if (this.reconnector.closed) this.reconnector = new Reconnector({ baseDelayMs: this.config.reconnectDelayMs || 5000 })
+    const socket = this.ws
+    if (!socket || socket.readyState === 3) {
+      this.connect()
+      return
+    }
+    this.manualReconnect = true
+    try { socket.close() } catch {
+      this.manualReconnect = false
+      this.connect()
+    }
+  }
+
+  async sendProbe(uin) {
+    const id = String(uin || '').trim()
+    if (!/^\d{5,12}$/.test(id)) throw new Error('还没有主人 QQ 号')
+    if (this.ws?.readyState !== 1) throw new Error('DeepSeek 还没接上 QQ')
+    await this.call('send_private_msg', { user_id: id, message: '测试。我在。' })
   }
 }
 
